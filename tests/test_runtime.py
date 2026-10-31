@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 import grokbot_notify_sounds as gns
-from tests import sandbox
+from tests import sandbox, stop_suite_workers
 from tests.helpers import BUNDLE, config_with, insert_app, insert_record, make_db, read_state
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1083,6 +1083,9 @@ class QuietTestTests(unittest.TestCase):
 
 
 class NotifyParentTests(unittest.TestCase):
+    def tearDown(self):
+        stop_suite_workers()
+
     def test_missing_bot_does_not_spawn(self):
         err = io.StringIO()
         with redirect_stderr(err):
@@ -1175,6 +1178,9 @@ class NotifyParentTests(unittest.TestCase):
 
 
 class BurstProcessTests(unittest.TestCase):
+    def tearDown(self):
+        stop_suite_workers()
+
     def test_six_processes_collapse_from_the_third_rule(self):
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
@@ -1251,15 +1257,20 @@ class BurstProcessTests(unittest.TestCase):
             played = ""
             while time.time() < deadline:
                 text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
-                played = play_log.read_text(encoding="utf-8") if play_log.exists() else ""
-                if "burst collapsed (4)" in text and played.count(".aiff") >= 3:
+                if "burst collapsed (4)" in text and text.count("dry-run sound=") >= 3:
                     break
                 time.sleep(0.05)
-            names = [Path(line.strip()).name for line in played.splitlines() if line.strip()]
-            self.assertEqual(names, ["Hero.aiff", "Glass.aiff", "Ping.aiff"], text)
-            self.assertNotIn("Pop.aiff", played)
-            self.assertNotIn("Frog.aiff", played)
-            self.assertNotIn("Funk.aiff", played)
+            sounds_played = []
+            marker = "dry-run sound="
+            for line in text.splitlines():
+                if marker not in line:
+                    continue
+                rest = line.split(marker, 1)[1]
+                sounds_played.append(rest.split(" volume=", 1)[0])
+            self.assertEqual(sounds_played, ["Hero", "Glass", "Ping"], text)
+            self.assertNotIn("dry-run sound=Pop", text)
+            self.assertNotIn("dry-run sound=Frog", text)
+            self.assertNotIn("dry-run sound=Funk", text)
             self.assertIn("burst collapsed (4)", text)
             self.assertEqual(text.count("result=play"), 2)
             self.assertEqual(text.count("result=collapsed"), 4)
@@ -1324,6 +1335,9 @@ class BurstProcessTests(unittest.TestCase):
 
 
 class DedupeProcessTests(unittest.TestCase):
+    def tearDown(self):
+        stop_suite_workers()
+
     def test_omitted_window_follows_the_burst_window(self):
         omitted = gns.normalize_config(
             {"default": {"sound": "Tink", "volume": 40}, "burst_window_seconds": 2}
@@ -1420,8 +1434,7 @@ class DedupeProcessTests(unittest.TestCase):
         self.assertIn("result=dup", text)
         self.assertEqual(text.count("result=play"), 1)
         self.assertNotIn("result=collapsed", text)
-        played = play_log.read_text(encoding="utf-8") if play_log.exists() else ""
-        self.assertEqual(played.count("Glass.aiff"), 1)
+        self.assertEqual(text.count("dry-run sound=Glass"), 1)
 
     def test_same_rule_different_bot_plays_both(self):
         config, state, env, play_log, log_path = self._layout()
@@ -1432,8 +1445,7 @@ class DedupeProcessTests(unittest.TestCase):
         text = self._wait(log_path, lambda raw: raw.count("result=play") >= 2)
         self.assertGreaterEqual(text.count("result=play"), 2)
         self.assertNotIn("result=dup", text)
-        played = self._wait(play_log, lambda raw: raw.count("Glass.aiff") >= 2)
-        self.assertGreaterEqual(played.count("Glass.aiff"), 2)
+        self.assertGreaterEqual(text.count("dry-run sound=Glass"), 2)
 
     def test_zero_dedupe_window_plays_both(self):
         config, state, env, play_log, log_path = self._layout()
@@ -1462,8 +1474,7 @@ class DedupeProcessTests(unittest.TestCase):
         text = self._wait(log_path, lambda raw: raw.count("result=play") >= 2)
         self.assertGreaterEqual(text.count("result=play"), 2)
         self.assertNotIn("result=dup", text)
-        played = self._wait(play_log, lambda raw: raw.count("Glass.aiff") >= 2)
-        self.assertGreaterEqual(played.count("Glass.aiff"), 2)
+        self.assertGreaterEqual(text.count("dry-run sound=Glass"), 2)
 
 
 class SandboxTests(unittest.TestCase):
@@ -1475,14 +1486,16 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(gns.player_tool("say"), str(sandbox.FAKE_BIN / "say"))
         self.assertEqual(gns.player_tool("launchctl"), "launchctl")
 
-    def test_play_commands_runs_the_fake(self):
+    def test_play_commands_records_a_dry_run(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         log = Path(tmp.name) / "played"
         os.environ["PLAY_LOG"] = str(log)
         self.addCleanup(os.environ.pop, "PLAY_LOG", None)
+        before = len(gns.DRY_RUN_PLAYS)
         gns.play_commands([["afplay", "-v", "0.4", "/System/Library/Sounds/Tink.aiff"]])
-        self.assertEqual(log.read_text(encoding="utf-8").strip(), "/System/Library/Sounds/Tink.aiff")
+        self.assertEqual(gns.DRY_RUN_PLAYS[before:], [{"sound": "Tink", "volume": "0.4", "say": "none"}])
+        self.assertFalse(log.exists())
 
     def test_spawned_workers_are_recorded_and_reaped(self):
         tmp = tempfile.TemporaryDirectory()
