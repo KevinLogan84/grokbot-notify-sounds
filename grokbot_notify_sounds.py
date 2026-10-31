@@ -43,14 +43,27 @@ def _fast_notify_main(argv: list[str]) -> int:
             continue
         forwarded.append(arg)
     command = [sys.executable, os.path.abspath(__file__), "--notify-worker", *forwarded]
-    subprocess.Popen(
+    proc = subprocess.Popen(
         command,
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _record_child_pid(proc.pid)
     return 0
+
+
+def _record_child_pid(pid: int) -> None:
+    """Append a detached child's pid to $GROKBOT_NOTIFY_CHILD_PIDS so tests can reap it."""
+    target = os.environ.get("GROKBOT_NOTIFY_CHILD_PIDS", "")
+    if not target:
+        return
+    try:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(f"{int(pid)}\n")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__" and _should_fast_notify(sys.argv):
@@ -1275,9 +1288,21 @@ class PlaybackError(Exception):
         super().__init__(f"playback failed (exit {self.code})")
 
 
+PLAYER_BIN_ENV = "GROKBOT_NOTIFY_BIN_DIR"
+
+
+def player_tool(name: str) -> str:
+    """Resolve afplay or say. $GROKBOT_NOTIFY_BIN_DIR forces fakes from that directory (tests)."""
+    override = os.environ.get(PLAYER_BIN_ENV, "")
+    if override and name in ("afplay", "say"):
+        return os.path.join(override, name)
+    return name
+
+
 def play_commands(commands: list[list[str]]) -> None:
     """Run afplay and say, one after another. Tests replace this function."""
     for command in commands:
+        command = [player_tool(command[0]), *command[1:]] if command else command
         result = subprocess.run(command, check=False)
         if result.returncode != 0:
             raise PlaybackError(result.returncode)
@@ -1856,7 +1881,7 @@ def read_voice_listing() -> str | None:
     if _VOICE_OVERRIDE_SET:
         return _VOICE_LISTING_OVERRIDE
     try:
-        result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=False)
+        result = subprocess.run([player_tool("say"), "-v", "?"], capture_output=True, text=True, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
@@ -2585,6 +2610,7 @@ def spawn_drainer(config_path: Path, state_path: Path) -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _record_child_pid(proc.pid)
     return int(proc.pid)
 
 

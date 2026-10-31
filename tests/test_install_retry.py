@@ -40,7 +40,7 @@ exit 0
 
 class InstallRetryTests(unittest.TestCase):
     def _run(self, mode):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         home = root / "home"

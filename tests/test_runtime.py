@@ -1,5 +1,6 @@
 """Queue, voices, config edits, and --notify."""
 
+import contextlib
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import tempfile
 import unittest
 
 import grokbot_notify_sounds as gns
+from tests import sandbox
 from tests.helpers import BUNDLE, config_with, insert_app, insert_record, make_db, read_state
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +40,7 @@ def glass_item(name, at, say=False):
 
 class QueueTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.lock = Path(self.tmp.name) / "state" / "playback.lock"
         self.state = Path(self.tmp.name) / "state" / "state.json"
@@ -287,7 +289,7 @@ class VoiceAndSoundTests(unittest.TestCase):
         self.assertIn("playback failed", err)
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.config = Path(self.tmp.name) / "config.json"
         self.config.write_text(
@@ -306,7 +308,7 @@ class VoiceAndSoundTests(unittest.TestCase):
 
 class EditSurfaceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -487,7 +489,7 @@ class EditSurfaceTests(unittest.TestCase):
 
 class NotifyTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -717,7 +719,7 @@ class InstallTests(unittest.TestCase):
     def test_install_modes_and_uninstall_shim(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## Bot line\n\n" + BOT_LINE + "\n", readme)
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             stub = Path(tmp) / "stub"
             home.mkdir()
@@ -784,7 +786,7 @@ class InstallTests(unittest.TestCase):
 
 class ModeTests(unittest.TestCase):
     def test_set_mode_without_launchctl(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "config.json"
             config.write_text("{}\n", encoding="utf-8")
@@ -827,7 +829,7 @@ def _quiet_window(now):
 
 class VoiceMatchTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -946,7 +948,7 @@ class VoiceMatchTests(unittest.TestCase):
 
 class NotifyBotSetTests(unittest.TestCase):
     def test_middle_dot_and_status(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "config.json"
             state = root / "state.json"
@@ -990,7 +992,7 @@ class NotifyBotSetTests(unittest.TestCase):
 
 class QuietTestTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -1089,8 +1091,9 @@ class NotifyParentTests(unittest.TestCase):
         self.assertIn("--bot", err.getvalue())
 
     def _home(self):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.addCleanup(sandbox.reap_children)  # runs first: workers exit before rmtree
         home = Path(tmp.name)
         config = home / "config.json"
         state = home / "state" / "state.json"
@@ -1112,6 +1115,7 @@ class NotifyParentTests(unittest.TestCase):
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["GROKBOT_NOTIFY_BIN_DIR"] = str(bindir)
         env["PLAY_LOG"] = str(play_log)
         env["SAY_LOG"] = str(say_log)
         return home, config, state, env, play_log, say_log
@@ -1172,8 +1176,10 @@ class NotifyParentTests(unittest.TestCase):
 
 class BurstProcessTests(unittest.TestCase):
     def test_six_processes_collapse_from_the_third_rule(self):
-        # The detached drain worker can still be writing state when the test ends.
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.addCleanup(sandbox.reap_children)  # runs first: the drain worker exits before rmtree
+        with contextlib.nullcontext(tmp_dir.name) as tmp:
             home = Path(tmp)
             config = home / "config.json"
             state = home / "state" / "state.json"
@@ -1215,6 +1221,7 @@ class BurstProcessTests(unittest.TestCase):
             env = os.environ.copy()
             env["HOME"] = str(home)
             env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+            env["GROKBOT_NOTIFY_BIN_DIR"] = str(bindir)
             env["PLAY_LOG"] = str(play_log)
             script = str(ROOT / "grokbot_notify_sounds.py")
             for bot, _sound in sounds:
@@ -1269,7 +1276,7 @@ class BurstProcessTests(unittest.TestCase):
 
         handler = Grab()
         gns.LOG.addHandler(handler)
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         lock = Path(tmp.name) / "playback.lock"
         config = config_with([], burst_threshold=3, burst_window_seconds=5, queue_max=20)
@@ -1333,8 +1340,9 @@ class DedupeProcessTests(unittest.TestCase):
         self.assertEqual(gns.dedupe_window_seconds(disabled), 0.0)
 
     def _layout(self):
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.addCleanup(sandbox.reap_children)  # runs first: workers exit before rmtree
         home = Path(tmp.name)
         config = home / "config.json"
         state = home / "state" / "state.json"
@@ -1365,6 +1373,7 @@ class DedupeProcessTests(unittest.TestCase):
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["GROKBOT_NOTIFY_BIN_DIR"] = str(bindir)
         env["PLAY_LOG"] = str(play_log)
         log_path = home / "Library" / "Logs" / "grokbot-notify-sounds.log"
         return config, state, env, play_log, log_path
@@ -1455,3 +1464,36 @@ class DedupeProcessTests(unittest.TestCase):
         self.assertNotIn("result=dup", text)
         played = self._wait(play_log, lambda raw: raw.count("Glass.aiff") >= 2)
         self.assertGreaterEqual(played.count("Glass.aiff"), 2)
+
+
+class SandboxTests(unittest.TestCase):
+    """The suite must never reach the real afplay or say, in this process or in workers."""
+
+    def test_player_resolves_to_the_fake_bin_dir(self):
+        self.assertEqual(os.environ.get("GROKBOT_NOTIFY_BIN_DIR"), str(sandbox.FAKE_BIN))
+        self.assertEqual(gns.player_tool("afplay"), str(sandbox.FAKE_BIN / "afplay"))
+        self.assertEqual(gns.player_tool("say"), str(sandbox.FAKE_BIN / "say"))
+        self.assertEqual(gns.player_tool("launchctl"), "launchctl")
+
+    def test_play_commands_runs_the_fake(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = Path(tmp.name) / "played"
+        os.environ["PLAY_LOG"] = str(log)
+        self.addCleanup(os.environ.pop, "PLAY_LOG", None)
+        gns.play_commands([["afplay", "-v", "0.4", "/System/Library/Sounds/Tink.aiff"]])
+        self.assertEqual(log.read_text(encoding="utf-8").strip(), "/System/Library/Sounds/Tink.aiff")
+
+    def test_spawned_workers_are_recorded_and_reaped(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(sandbox.reap_children)
+        config = Path(tmp.name) / "config.json"
+        config.write_text(json.dumps({"default": {"sound": "Tink", "volume": 40, "say": False}, "rules": []}))
+        state = Path(tmp.name) / "state" / "state.json"
+        state.parent.mkdir()
+        pid = gns.spawn_drainer(config, state)
+        recorded = sandbox.CHILD_PIDS.read_text(encoding="utf-8").split()
+        self.assertIn(str(pid), recorded)
+        sandbox.reap_children()
+        self.assertFalse(sandbox._alive(pid))

@@ -176,7 +176,7 @@ class ValidateTests(unittest.TestCase):
     def test_unknown_builtin_and_missing_custom_file(self):
         import tempfile
 
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             sounds = Path(tmp) / "sounds"
             sounds.mkdir()
             (sounds / "Tink.aiff").write_bytes(b"")
@@ -223,7 +223,7 @@ class ValidateTests(unittest.TestCase):
         import tempfile
 
         text = (ROOT / "config.example.jsonc").read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             sounds = Path(tmp)
             for name in ("Tink", "Hero", "Sosumi", "Glass"):
                 (sounds / f"{name}.aiff").write_bytes(b"")
