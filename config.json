@@ -1,0 +1,13 @@
+{
+  "_comment": "Seed config. No rules yet. Set bundle_id after --list-apps, then add each sound and volume yourself. See config.example.jsonc.",
+  "enabled": true,
+  "poll_interval_seconds": 2,
+  "bundle_id": "",
+  "master_volume": 100,
+  "default": {
+    "_comment": "Used when no rule matches, and the only sound played during soft quiet hours.",
+    "sound": "Tink",
+    "volume": 40
+  },
+  "rules": []
+}

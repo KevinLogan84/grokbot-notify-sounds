@@ -1,0 +1,63 @@
+{
+  // Master switch. false still advances the cursor and plays nothing.
+  "enabled": true,
+
+  // Seconds between Notification Center polls. Must be greater than 0.
+  "poll_interval_seconds": 2,
+
+  // Bundle id from --list-apps. An empty string matches no app.
+  "bundle_id": "",
+
+  // Integer 0–100. afplay volume is (rule volume / 100) * (master_volume / 100).
+  "master_volume": 100,
+
+  // Per-rule silence after a play, in seconds. 0 turns cooldown off.
+  // A skipped play does not reset the window. Keyed by rule name.
+  "cooldown_seconds": 0,
+
+  // Local time. If start is later than end, the window wraps midnight.
+  // mute: no sound and no speech. soft: default sound only, and speech only if default.say is true.
+  "quiet_hours": {
+    "enabled": false,
+    "start": "22:00",
+    "end": "07:00",
+    "mode": "mute",
+  },
+
+  // Fallback when nothing matches. Rule volume falls back here when a rule omits volume.
+  "default": {
+    "sound": "Tink",
+    "volume": 40,
+    "say": false,
+    "voice": null,
+  },
+
+  // First match wins. Put a specific rule above a broader one.
+  "rules": [
+    {
+      // Bot plus text. Both must match.
+      "name": "Alfred shipped",
+      "bot": "Alfred",
+      "regex": "shipped|delivered",
+      "match_in": "body",
+      "sound": "Hero",
+      "volume": 60,
+      "say": true,
+      "voice": "Zarvox",
+    },
+    {
+      // Text only. A list matches if any phrase appears.
+      "name": "Needs approval",
+      "contains": ["approve", "needs your OK"],
+      "match_in": "both",
+      "sound": "Sosumi",
+    },
+    {
+      // Bot only. Case-insensitive substring of the title or the subtitle.
+      "name": "Alfred answers",
+      "bot": "Alfred",
+      "sound": "Glass",
+      "volume": 80,
+    },
+  ],
+}
