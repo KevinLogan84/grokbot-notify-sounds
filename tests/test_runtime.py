@@ -222,6 +222,7 @@ class VoiceAndSoundTests(unittest.TestCase):
             gns.clear_voice_cache()
 
     def test_say_text_and_false_say(self):
+        gns.set_voice_listing("Samantha            en_US    # Hello\n")
         spoken = gns.render_say_text("Hi {bot} {title} {body} {other}", "Al", "Title", "")
         self.assertEqual(spoken, "Hi Al Title  {other}")
         long = gns.render_say_text("x" * 400, "", "", "")
@@ -955,13 +956,13 @@ class NotifyBotSetTests(unittest.TestCase):
             err = io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 code = gns.main(
-                    ["--set", 'notify_bots=["Karen · Shopper"]', "--config", str(config), "--state", str(state)],
+                    ["--set", 'notify_bots=["Shopper · Bot"]', "--config", str(config), "--state", str(state)],
                     log_path=log,
                 )
             self.assertEqual(code, 0, err.getvalue())
-            self.assertEqual(out.getvalue().strip(), 'set notify_bots=["Karen · Shopper"]')
+            self.assertEqual(out.getvalue().strip(), 'set notify_bots=["Shopper · Bot"]')
             stored = json.loads(config.read_text(encoding="utf-8"))["notify_bots"]
-            self.assertEqual(stored, ["Karen · Shopper"])
+            self.assertEqual(stored, ["Shopper · Bot"])
             self.assertIn("·", config.read_text(encoding="utf-8"))
             out = io.StringIO()
             with redirect_stdout(out):
@@ -970,7 +971,7 @@ class NotifyBotSetTests(unittest.TestCase):
                     log_path=log,
                 )
             self.assertEqual(code, 0)
-            self.assertIn('notify_bots: ["Karen · Shopper"]', out.getvalue())
+            self.assertIn('notify_bots: ["Shopper · Bot"]', out.getvalue())
             before = config.read_bytes()
             err = io.StringIO()
             with redirect_stderr(err):
