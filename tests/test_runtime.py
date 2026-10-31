@@ -105,7 +105,7 @@ class QueueTests(unittest.TestCase):
         over.start()
         over.drain(timeout=2)
         over.close()
-        self.assertEqual(paths, ["Glass.aiff", "Tink.aiff"])
+        self.assertEqual(paths, ["Glass.aiff", "Glass.aiff", "Glass.aiff"])
 
     def test_cooldown_and_queue_cap(self):
         played = []
@@ -152,7 +152,7 @@ class QueueTests(unittest.TestCase):
         queue.start()
         queue.drain(timeout=2)
         queue.close()
-        self.assertEqual([Path(path).name for path in played], ["Glass.aiff", "Tink.aiff"])
+        self.assertEqual([Path(path).name for path in played], ["Glass.aiff", "Glass.aiff", "Tink.aiff"])
 
     def test_lock_blocks_a_second_player(self):
         order = []
@@ -507,7 +507,7 @@ class NotifyTests(unittest.TestCase):
             json.dumps(
                 {
                     "burst_threshold": 3,
-                    "burst_window_seconds": 5,
+                    "burst_window_seconds": 1.5,
                     "queue_max": 20,
                     "default": {"sound": "Tink", "volume": 40, "say": False},
                     "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}],
@@ -519,7 +519,7 @@ class NotifyTests(unittest.TestCase):
     def tearDown(self):
         self.release.set()
         for thread in self.threads:
-            thread.join(3)
+            thread.join(4)
         gns.spawn_drainer = self.original_spawn
         gns.play_commands = self.original_play
         gns.connect_readonly = self.original_connect
@@ -564,7 +564,7 @@ class NotifyTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(out, "")
-        self.threads[0].join(2)
+        self.threads[0].join(4)
         self.assertEqual(len(self.played), 1)
         self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
         text = self.log.read_text(encoding="utf-8")
@@ -614,11 +614,12 @@ class NotifyTests(unittest.TestCase):
         time.sleep(0.25)
         self.release.set()
         for thread in self.threads:
-            thread.join(3)
+            thread.join(4)
         self.assertEqual(len(self.spawned), 1)
-        self.assertEqual(len(self.played), 2)
-        self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
-        self.assertTrue(self.played[1][0][3].endswith("/Tink.aiff"))
+        self.assertEqual(len(self.played), 3)
+        for commands in self.played:
+            self.assertTrue(commands[0][3].endswith("/Glass.aiff"))
+        self.assertIn("burst collapsed (2)", self.log.read_text(encoding="utf-8"))
 
     def test_shared_cooldown_and_spawn_flags(self):
         def inline(config_path, state_path):
@@ -631,6 +632,7 @@ class NotifyTests(unittest.TestCase):
             json.dumps(
                 {
                     "cooldown_seconds": 120,
+                    "burst_window_seconds": 0.3,
                     "default": {"sound": "Tink", "volume": 40},
                     "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass"}],
                 }
@@ -788,3 +790,475 @@ class ModeTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertNotIn("usage:", err.getvalue().lower())
             self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["mode"], "notify")
+
+
+FIXTURE = (ROOT / "tests" / "fixtures" / "macos-say-voices.txt").read_text(encoding="utf-8")
+
+
+def _quiet_window(now):
+    start = f"{now.hour:02d}:00"
+    end = f"{(now.hour + 2) % 24:02d}:00"
+    return start, end
+
+
+class VoiceMatchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config = self.root / "config.json"
+        self.state = self.root / "state.json"
+        self.log = self.root / "log"
+        self.sounds = self.root / "sounds"
+        self.sounds.mkdir()
+        (self.sounds / "Tink.aiff").write_bytes(b"")
+        (self.sounds / "Glass.aiff").write_bytes(b"")
+        self.config.write_text("{}\n", encoding="utf-8")
+        gns.set_sounds_dir(self.sounds)
+        gns.set_voice_listing(FIXTURE)
+        self.addCleanup(gns.clear_voice_listing)
+        self.addCleanup(lambda: gns.set_sounds_dir(None))
+        self.addCleanup(lambda: gns.set_voice_state_path(None))
+
+    def _main(self, argv):
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = gns.main(argv + ["--config", str(self.config), "--state", str(self.state)], log_path=self.log)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_fixture_matches_names_without_rewriting_the_file(self):
+        names = [voice.name for voice in gns.parse_voices(FIXTURE)]
+        self.assertIn("Samantha", names)
+        self.assertIn("Samantha (English (US))", names)
+        self.assertIn("Flo (English (US))", names)
+        self.assertEqual(gns.resolve_voice("Flo", gns.parse_voices(FIXTURE)).name, "Flo (English (US))")
+        self.assertEqual(gns.resolve_voice("flo", gns.parse_voices(FIXTURE)).name, "Flo (English (US))")
+        self.assertEqual(gns.resolve_voice("Samantha", gns.parse_voices(FIXTURE)).name, "Samantha")
+        self.assertEqual(gns.resolve_voice("SAMANTHA", gns.parse_voices(FIXTURE)).name, "Samantha")
+        self.assertEqual(
+            gns.resolve_voice("Samantha (English (US))", gns.parse_voices(FIXTURE)).name,
+            "Samantha (English (US))",
+        )
+        self.assertEqual(gns.resolve_voice("reed", gns.parse_voices(FIXTURE)).name, "Reed (Premium)")
+        self.assertEqual(gns.resolve_voice("Reed (Enhanced)", gns.parse_voices(FIXTURE)).name, "Reed (Enhanced)")
+
+        code, out, err = self._main(["--set", "default.voice=flo"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "set default.voice=flo")
+        stored = json.loads(self.config.read_text(encoding="utf-8"))["default"]["voice"]
+        self.assertEqual(stored, "flo")
+        code, out, err = self._main(["--validate"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "ok")
+        code, out, err = self._main(["--set", "default.voice=Samantha (English (US))"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            json.loads(self.config.read_text(encoding="utf-8"))["default"]["voice"],
+            "Samantha (English (US))",
+        )
+        commands = gns.build_commands("Glass", 40, 100, True, "flo", "", "", "hi")
+        self.assertEqual(commands[1][:3], ["say", "-v", "Flo (English (US))"])
+
+    def test_unset_spellings_and_autopick_fallback(self):
+        code, out, err = self._main(["--set", "default.say=true", "--set", "default.voice=Samantha"])
+        self.assertEqual(code, 0, err)
+        code, out, err = self._main(["--set", "default.voice="])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "unset default.voice")
+        data = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertNotIn("voice", data["default"])
+        self.assertTrue(data["default"]["say"])
+        code, out, err = self._main(["--set", "default.voice=Samantha"])
+        self.assertEqual(code, 0, err)
+        code, out, err = self._main(["--unset", "default.voice"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "unset default.voice")
+        self.assertNotIn("voice", json.loads(self.config.read_text(encoding="utf-8"))["default"])
+        config = gns.load_runtime_config(self.config)
+        outcome = gns.plan_notification("t", "", "hello", config, now=datetime(2026, 10, 31, 12, 0), cooldowns={})
+        self.assertEqual(outcome.commands[1][:3], ["say", "-v", "Zoe (Premium)"])
+
+        only_glass = self.root / "only-glass"
+        only_glass.mkdir()
+        (only_glass / "Glass.aiff").write_bytes(b"")
+        gns.set_sounds_dir(only_glass)
+        self.config.write_text(json.dumps({"default": {"sound": "Glass", "volume": 40}}) + "\n", encoding="utf-8")
+        before = self.config.read_bytes()
+        code, out, err = self._main(["--unset", "default.sound"])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertNotIn("usage:", err.lower())
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_voice_cache_does_not_call_say(self):
+        gns.clear_voice_listing()
+        gns.clear_voice_cache()
+        gns.set_voice_state_path(self.state)
+        cache = self.state.parent / "voices.json"
+        cache.write_text(json.dumps([{"name": "Samantha", "lang": "en_US"}], ensure_ascii=False) + "\n", encoding="utf-8")
+
+        def boom():
+            raise AssertionError("say was called")
+
+        original = gns.read_voice_listing
+        gns.read_voice_listing = boom
+        try:
+            voices = gns.load_voices()
+        finally:
+            gns.read_voice_listing = original
+            gns.clear_voice_cache()
+        self.assertEqual(voices[0].name, "Samantha")
+
+
+class NotifyBotSetTests(unittest.TestCase):
+    def test_middle_dot_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.json"
+            state = root / "state.json"
+            log = root / "log"
+            config.write_text("{}\n", encoding="utf-8")
+            out = io.StringIO()
+            err = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = gns.main(
+                    ["--set", 'notify_bots=["Karen · Shopper"]', "--config", str(config), "--state", str(state)],
+                    log_path=log,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertEqual(out.getvalue().strip(), 'set notify_bots=["Karen · Shopper"]')
+            stored = json.loads(config.read_text(encoding="utf-8"))["notify_bots"]
+            self.assertEqual(stored, ["Karen · Shopper"])
+            self.assertIn("·", config.read_text(encoding="utf-8"))
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = gns.main(
+                    ["--status", "--config", str(config), "--state", str(state), "--db", str(root / "missing")],
+                    log_path=log,
+                )
+            self.assertEqual(code, 0)
+            self.assertIn('notify_bots: ["Karen · Shopper"]', out.getvalue())
+            before = config.read_bytes()
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = gns.main(["--set", "notify_bots=[1]", "--config", str(config), "--state", str(state)], log_path=log)
+            self.assertEqual(code, 2)
+            self.assertEqual(config.read_bytes(), before)
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = gns.main(
+                    ["--set", 'quiet_hours={"enabled": false, "start": "22:00", "end": "07:00", "mode": "mute"}', "--config", str(config), "--state", str(state)],
+                    log_path=log,
+                )
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertFalse(json.loads(config.read_text(encoding="utf-8"))["quiet_hours"]["enabled"])
+
+
+class QuietTestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config = self.root / "config.json"
+        self.state = self.root / "state.json"
+        self.log = self.root / "log"
+        self.played = []
+        self.original = gns.play_commands
+        gns.play_commands = self.played.append
+        now = datetime.now()
+        start, end = _quiet_window(now)
+        self.config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "paused": False,
+                    "cooldown_seconds": 0,
+                    "quiet_hours": {"enabled": True, "start": start, "end": end, "mode": "mute"},
+                    "default": {"sound": "Tink", "volume": 40, "say": False},
+                    "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        gns.play_commands = self.original
+
+    def _main(self, argv):
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = gns.main(argv + ["--config", str(self.config), "--state", str(self.state)], log_path=self.log)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_mute_soft_and_as_live(self):
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("sound: Glass", out)
+        self.assertEqual(len(self.played), 1)
+        self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
+
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--respect-quiet-hours"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("quiet hours muted the sound", out)
+        self.assertEqual(len(self.played), 1)
+
+        data = json.loads(self.config.read_text(encoding="utf-8"))
+        data["quiet_hours"]["mode"] = "soft"
+        self.config.write_text(json.dumps(data), encoding="utf-8")
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--respect-quiet-hours"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("quiet hours softened the sound to the default sound", out)
+        self.assertTrue(self.played[-1][0][3].endswith("/Tink.aiff"))
+
+        data["paused"] = True
+        data["quiet_hours"]["mode"] = "mute"
+        self.config.write_text(json.dumps(data), encoding="utf-8")
+        before = len(self.played)
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--as-live"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("suppressed because paused", out)
+        self.assertEqual(len(self.played), before)
+
+        data["paused"] = False
+        data["enabled"] = False
+        self.config.write_text(json.dumps(data), encoding="utf-8")
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--as-live"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("suppressed because disabled", out)
+        self.assertEqual(len(self.played), before)
+
+
+class NotifyParentTests(unittest.TestCase):
+    def test_missing_bot_does_not_spawn(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = gns._fast_notify_main(["prog", "--notify"])
+        self.assertEqual(code, 2)
+        self.assertIn("--bot", err.getvalue())
+
+    def _home(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        config = home / "config.json"
+        state = home / "state" / "state.json"
+        state.parent.mkdir()
+        config.write_text(
+            json.dumps({"default": {"sound": "Tink", "volume": 40, "say": False}, "rules": []}) + "\n",
+            encoding="utf-8",
+        )
+        bindir = home / "bin"
+        bindir.mkdir()
+        play_log = home / "played"
+        say_log = home / "said"
+        afplay = bindir / "afplay"
+        afplay.write_text('#!/bin/sh\nprintf \'%s\\n\' "$3" >> "$PLAY_LOG"\nexit 0\n', encoding="utf-8")
+        afplay.chmod(0o755)
+        say = bindir / "say"
+        say.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SAY_LOG"\nsleep 2\nexit 0\n', encoding="utf-8")
+        say.chmod(0o755)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["PLAY_LOG"] = str(play_log)
+        env["SAY_LOG"] = str(say_log)
+        return home, config, state, env, play_log, say_log
+
+    def test_parent_returns_before_a_slow_worker(self):
+        _home, config, state, env, _played, _said = self._home()
+        env["GROKBOT_NOTIFY_WORKER_DELAY"] = "0.8"
+        began = time.monotonic()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "grokbot_notify_sounds.py"),
+                "--notify",
+                "--bot",
+                "Alfred",
+                "--config",
+                str(config),
+                "--state",
+                str(state),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 0.2)
+
+    def test_parent_does_not_call_say(self):
+        _home, config, state, env, _played, said = self._home()
+        began = time.monotonic()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "grokbot_notify_sounds.py"),
+                "--notify",
+                "--bot",
+                "Alfred",
+                "--title",
+                "hi",
+                "--config",
+                str(config),
+                "--state",
+                str(state),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 0.2)
+        if said.exists():
+            self.assertEqual(said.read_text(encoding="utf-8"), "")
+
+
+class BurstProcessTests(unittest.TestCase):
+    def test_six_processes_collapse_from_the_third_rule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / "config.json"
+            state = home / "state" / "state.json"
+            state.parent.mkdir()
+            play_log = home / "played"
+            log_dir = home / "Library" / "Logs"
+            sounds = [
+                ("One", "Hero"),
+                ("Two", "Glass"),
+                ("Three", "Ping"),
+                ("Four", "Pop"),
+                ("Five", "Frog"),
+                ("Six", "Funk"),
+            ]
+            config.write_text(
+                json.dumps(
+                    {
+                        "burst_threshold": 3,
+                        "burst_window_seconds": 6,
+                        "cooldown_seconds": 0,
+                        "queue_max": 20,
+                        "default": {"sound": "Tink", "volume": 40, "say": False},
+                        "rules": [
+                            {"name": bot, "bot": bot, "sound": sound, "volume": 100, "say": False}
+                            for bot, sound in sounds
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bindir = home / "bin"
+            bindir.mkdir()
+            afplay = bindir / "afplay"
+            afplay.write_text('#!/bin/sh\nprintf \'%s\\n\' "$3" >> "$PLAY_LOG"\nexit 0\n', encoding="utf-8")
+            afplay.chmod(0o755)
+            say = bindir / "say"
+            say.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            say.chmod(0o755)
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+            env["PLAY_LOG"] = str(play_log)
+            script = str(ROOT / "grokbot_notify_sounds.py")
+            for bot, _sound in sounds:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        script,
+                        "--notify-worker",
+                        "--bot",
+                        bot,
+                        "--title",
+                        bot,
+                        "--config",
+                        str(config),
+                        "--state",
+                        str(state),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            log_path = log_dir / "grokbot-notify-sounds.log"
+            deadline = time.time() + 12
+            text = ""
+            played = ""
+            while time.time() < deadline:
+                text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+                played = play_log.read_text(encoding="utf-8") if play_log.exists() else ""
+                if "burst collapsed (4)" in text and played.count(".aiff") >= 3:
+                    break
+                time.sleep(0.05)
+            names = [Path(line.strip()).name for line in played.splitlines() if line.strip()]
+            self.assertEqual(names, ["Hero.aiff", "Glass.aiff", "Ping.aiff"], text)
+            self.assertNotIn("Pop.aiff", played)
+            self.assertNotIn("Frog.aiff", played)
+            self.assertNotIn("Funk.aiff", played)
+            self.assertIn("burst collapsed (4)", text)
+            self.assertEqual(text.count("result=play"), 2)
+            self.assertEqual(text.count("result=collapsed"), 4)
+
+    def test_in_process_summary_uses_the_third_sound_and_speech(self):
+        gns.set_voice_listing("Samantha            en_US    # Hello.\n")
+        self.addCleanup(gns.clear_voice_listing)
+        played = []
+        messages = []
+
+        class Grab(gns.logging.Handler):
+            def emit(self, record):
+                messages.append(record.getMessage())
+
+        handler = Grab()
+        gns.LOG.addHandler(handler)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        lock = Path(tmp.name) / "playback.lock"
+        config = config_with([], burst_threshold=3, burst_window_seconds=5, queue_max=20)
+        queue = gns.PlaybackQueue(lambda: config, played.append, lock, clock=lambda: 10.0)
+        sounds = ["Hero", "Glass", "Ping", "Pop", "Frog", "Funk"]
+        try:
+            for sound in sounds:
+                say = sound == "Ping"
+                commands = gns.build_commands(
+                    sound,
+                    100,
+                    100,
+                    say,
+                    "Samantha" if say else None,
+                    "Title",
+                    "",
+                    "body",
+                    say_text="hello there" if say else None,
+                )
+                queue.enqueue(gns.PlayItem(commands, sound, 10.0, say, sound=sound, source="notify", bot=sound))
+            queue.start()
+            queue.drain(timeout=2)
+            queue.close()
+        finally:
+            gns.LOG.removeHandler(handler)
+        names = [Path(item[0][3]).name for item in played]
+        self.assertEqual(names, ["Hero.aiff", "Glass.aiff", "Ping.aiff"])
+        self.assertEqual(played[2][1], ["say", "-v", "Samantha", "and 3 more"])
+        self.assertIn("burst collapsed (4)", messages)
+        self.assertEqual(sum(1 for message in messages if message.endswith("result=play")), 2)
+        self.assertEqual(sum(1 for message in messages if message.endswith("result=collapsed")), 4)
+
+        played.clear()
+        lone = gns.build_commands("Ping", 100, 100, True, "Samantha", "Title", "", "body", say_text="hello there")
+        queue = gns.PlaybackQueue(lambda: config, played.append, lock, clock=lambda: 10.0)
+        for sound in ("Hero", "Glass", "Ping"):
+            commands = lone if sound == "Ping" else gns.build_commands(sound, 100, 100, False, None, "", "", "")
+            queue.enqueue(gns.PlayItem(commands, sound, 10.0, sound == "Ping"))
+        queue.start()
+        queue.drain(timeout=2)
+        queue.close()
+        self.assertEqual(played[2][1][-1], "hello there")
+        self.assertNotIn("and 0 more", " ".join(played[2][1]))

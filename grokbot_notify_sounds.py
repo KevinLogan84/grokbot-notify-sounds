@@ -7,18 +7,65 @@ never uses the network or the Keychain.
 
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _should_fast_notify(argv: list[str]) -> bool:
+    """Parent --notify returns before the heavy imports and before say -v '?'."""
+    if "--notify-worker" in argv or "--drain-notify" in argv:
+        return False
+    return "--notify" in argv
+
+
+def _notify_bot_argument(argv: list[str]) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg == "--bot" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--bot="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _fast_notify_main(argv: list[str]) -> int:
+    """Minimum argv parse, spawn the worker, exit. Does not import the player."""
+    import subprocess
+
+    if not _notify_bot_argument(argv):
+        print("--notify requires --bot NAME.", file=sys.stderr)
+        return 2
+    forwarded: list[str] = []
+    args = list(argv)
+    if args and not str(args[0]).startswith("-"):
+        args = args[1:]
+    for arg in args:
+        if arg == "--notify":
+            continue
+        forwarded.append(arg)
+    command = [sys.executable, os.path.abspath(__file__), "--notify-worker", *forwarded]
+    subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return 0
+
+
+if __name__ == "__main__" and _should_fast_notify(sys.argv):
+    sys.exit(_fast_notify_main(sys.argv))
+
 import argparse
 import fcntl
 import json
 import logging
 import logging.handlers
-import os
 import plistlib
 import re
 import shutil
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
@@ -798,7 +845,7 @@ def build_commands(
         spoken = summary_text(title, subtitle, body)
     if not spoken:
         return commands
-    chosen = voice if voice else pick_natural_voice()
+    chosen = playback_voice_name(voice)
     if chosen:
         commands.append(["say", "-v", chosen, spoken])
     else:
@@ -1302,6 +1349,7 @@ SET_STRING_KEYS = {
     "quiet_hours.end",
     "quiet_hours.mode",
 }
+SET_JSON_KEYS = {"notify_bots", "rules", "default", "quiet_hours"}
 AGENT_LABEL = "com.grokbot.notify-sounds"
 
 
@@ -1431,7 +1479,22 @@ def _seed_quiet(raw: dict) -> dict:
     return current
 
 
+def _known_setting(key: str) -> bool:
+    return key in SET_BOOL_KEYS or key in SET_INT_KEYS or key in SET_NUMBER_KEYS or key in SET_STRING_KEYS or key in SET_JSON_KEYS
+
+
 def coerce_setting(key: str, value: str) -> object:
+    if not _known_setting(key):
+        raise ConfigError([f"Unknown setting {key!r}"])
+    if value.startswith("[") or value.startswith("{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ConfigError([f"Invalid JSON: {exc.msg} (line {exc.lineno})"]) from exc
+    if key == "notify_bots":
+        return [value]
+    if key in SET_JSON_KEYS:
+        raise ConfigError([f"{key} must be a JSON list or object"])
     if key in SET_BOOL_KEYS:
         lowered = value.casefold()
         if lowered == "true":
@@ -1452,8 +1515,26 @@ def coerce_setting(key: str, value: str) -> object:
     raise ConfigError([f"Unknown setting {key!r}"])
 
 
+def clear_setting(raw: dict, key: str) -> None:
+    if not _known_setting(key):
+        raise ConfigError([f"Unknown setting {key!r}"])
+    if "." in key:
+        parent_name, child = key.split(".", 1)
+        parent = raw.get(parent_name)
+        if isinstance(parent, dict):
+            parent.pop(child, None)
+        return
+    raw.pop(key, None)
+
+
 def apply_setting(raw: dict, key: str, value: str) -> None:
+    if value == "":
+        clear_setting(raw, key)
+        return
     coerced = coerce_setting(key, value)
+    if key in SET_JSON_KEYS or key == "notify_bots":
+        raw[key] = coerced
+        return
     if key.startswith("default."):
         _seed_default(raw)[key.split(".", 1)[1]] = coerced
         return
@@ -1469,6 +1550,11 @@ def apply_settings(raw: dict, pairs: list[str]) -> None:
         if not sep or not key:
             raise ConfigError([f"Expected key=value, got {pair!r}"])
         apply_setting(raw, key, value)
+
+
+def unset_settings(raw: dict, keys: list[str]) -> None:
+    for key in keys:
+        clear_setting(raw, key)
 
 
 def parse_json_value(text: str) -> object:
@@ -1555,6 +1641,7 @@ def render_status(
         f"enabled: {_format_bool(bool(config['enabled']))}",
         f"paused: {_format_bool(bool(config.get('paused', False)))}",
         f"mode: {config.get('mode', 'watch')}",
+        f"notify_bots: {json.dumps(list(config.get('notify_bots') or []), ensure_ascii=False)}",
         f"master_volume: {config['master_volume']}",
         f"poll_interval_seconds: {_format_number(config['poll_interval_seconds'])}",
         f"cooldown_seconds: {_format_number(config['cooldown_seconds'])}",
@@ -1641,7 +1728,9 @@ _VOICE_OVERRIDE_SET = False
 _VOICE_LISTING_OVERRIDE = ""
 _VOICE_CACHE: list | None = None
 _VOICE_FAILED = False
-_VOICE_LINE = re.compile(r"^(.+?)\s{2,}([A-Za-z]{2}_[A-Za-z0-9]+)\s+#\s*(.*)$")
+_VOICE_LINE = re.compile(r"^(.*?)\s+([A-Za-z]{2,3}_[A-Za-z0-9]+)\s+#\s*(.*)$")
+_VOICE_STATE_PATH: Path | None = None
+VOICE_CACHE_NAME = "voices.json"
 
 
 class Voice:
@@ -1657,6 +1746,11 @@ def set_sounds_dir(path: Path | None) -> None:
 
 def active_sounds_dir() -> Path:
     return SYSTEM_SOUNDS_DIR if _SOUNDS_DIR_OVERRIDE is None else _SOUNDS_DIR_OVERRIDE
+
+
+def set_voice_state_path(path: Path | None) -> None:
+    global _VOICE_STATE_PATH
+    _VOICE_STATE_PATH = None if path is None else Path(path)
 
 
 def set_voice_listing(text: str) -> None:
@@ -1702,18 +1796,120 @@ def parse_voices(text: str) -> list:
     return voices
 
 
+def bare_voice_name(name: str) -> str:
+    """Strip trailing balanced parenthetical groups. Flo (English (US)) becomes Flo."""
+    text = name.strip()
+    while text.endswith(")"):
+        depth = 0
+        start = None
+        for index in range(len(text) - 1, -1, -1):
+            char = text[index]
+            if char == ")":
+                depth += 1
+            elif char == "(":
+                depth -= 1
+                if depth == 0:
+                    start = index
+                    break
+        if start is None or depth != 0:
+            break
+        text = text[:start].rstrip()
+    return text
+
+
+def resolve_voice(query: str, voices: list):
+    folded = query.strip().casefold()
+    if not folded or not voices:
+        return None
+    for voice in voices:
+        if voice.name.casefold() == folded:
+            return voice
+    matches = [voice for voice in voices if bare_voice_name(voice.name).casefold() == folded]
+    if not matches:
+        return None
+
+    def rank(voice: Voice):
+        if "(Premium)" in voice.name:
+            tier = 0
+        elif "(Enhanced)" in voice.name:
+            tier = 1
+        elif "(" not in voice.name:
+            tier = 2
+        else:
+            tier = 3
+        return (tier, voices.index(voice))
+
+    matches.sort(key=rank)
+    return matches[0]
+
+
+def _voice_cache_file() -> Path | None:
+    if _VOICE_STATE_PATH is None:
+        return None
+    return Path(_VOICE_STATE_PATH).parent / VOICE_CACHE_NAME
+
+
+def _read_voice_cache() -> list | None:
+    path = _voice_cache_file()
+    if path is None or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    voices = []
+    for item in data:
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("lang"), str):
+            voices.append(Voice(item["name"], item["lang"]))
+    return voices or None
+
+
+def _write_voice_cache(voices: list) -> None:
+    path = _voice_cache_file()
+    if path is None:
+        return
+    payload = [{"name": voice.name, "lang": voice.lang} for voice in voices]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
 def load_voices():
     global _VOICE_CACHE, _VOICE_FAILED
+    if _VOICE_OVERRIDE_SET:
+        if _VOICE_CACHE is None:
+            _VOICE_CACHE = parse_voices(_VOICE_LISTING_OVERRIDE)
+        return _VOICE_CACHE
     if _VOICE_CACHE is not None:
         return _VOICE_CACHE
     if _VOICE_FAILED:
         return None
+    cached = _read_voice_cache()
+    if cached is not None:
+        _VOICE_CACHE = cached
+        return cached
     text = read_voice_listing()
     if text is None:
         _VOICE_FAILED = True
         return None
     _VOICE_CACHE = parse_voices(text)
+    _write_voice_cache(_VOICE_CACHE)
     return _VOICE_CACHE
+
+
+def playback_voice_name(voice: str | None) -> str | None:
+    """Resolve a stored voice to the listing display name. None picks a natural voice."""
+    if voice:
+        voices = load_voices()
+        if not voices:
+            return voice
+        match = resolve_voice(voice, voices)
+        return match.name if match is not None else voice
+    return pick_natural_voice()
 
 
 def _voice_sort_key(voice: Voice, index: int):
@@ -1808,10 +2004,9 @@ def voice_errors(config: dict, voices) -> list[str]:
             f"{label}: voice {name!r} could not be checked because say -v '?' failed"
             for label, name in needed
         ]
-    names = {voice.name for voice in voices}
     errors = []
     for label, name in needed:
-        if name not in names:
+        if resolve_voice(name, voices) is None:
             errors.append(f"{label}: unknown voice {name!r}")
     return errors
 
@@ -1878,44 +2073,33 @@ class CooldownBook:
 
 
 class PlayItem:
-    def __init__(self, commands, rule_name: str, enqueued_at: float, say: bool):
+    def __init__(self, commands, rule_name: str, enqueued_at: float, say: bool, sound: str = "", bot: str | None = None, source: str = ""):
         self.commands = commands
         self.rule_name = rule_name
         self.enqueued_at = enqueued_at
         self.say = bool(say)
+        self.sound = sound
+        self.bot = bot
+        self.source = source
 
 
 def item_from_outcome(outcome, enqueued_at: float) -> PlayItem:
     say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
-    return PlayItem(outcome.commands, outcome.match.rule_name, enqueued_at, say)
-
-
-def collapse_commands(config: dict, collapsed: list, count: int) -> list[list[str]]:
-    default = config["default"]
-    speak = bool(default.get("say")) or any(item.say for item in collapsed)
-    return build_commands(
-        default["sound"],
-        int(default["volume"]),
-        int(config["master_volume"]),
-        speak,
-        default.get("voice") if speak else None,
-        "",
-        "",
-        "",
-        say_text=f"and {count} more" if speak else None,
-    )
+    sound = outcome.effective_sound or outcome.match.sound
+    return PlayItem(outcome.commands, outcome.match.rule_name, enqueued_at, say, sound=sound)
 
 
 class PlaybackQueue:
     """One worker plays sound, then say, then the next item. Never in parallel."""
 
-    def __init__(self, config_getter, player, lock_path, book=None, clock=None, now=None):
+    def __init__(self, config_getter, player, lock_path, book=None, clock=None, now=None, hold_for_burst=False):
         self.config_getter = config_getter
         self.player = player
         self.lock_path = Path(lock_path)
         self.book = book
         self.clock = clock or time.monotonic
         self.now = now or datetime.now
+        self.hold_for_burst = bool(hold_for_burst)
         self._items: deque = deque()
         self._overflow = 0
         self._cv = threading.Condition()
@@ -1978,46 +2162,99 @@ class PlaybackQueue:
         if self.book is not None:
             self.book.mark(item.rule_name, self.now())
 
-    def _handle_first(self, first: PlayItem) -> None:
-        config = self.config_getter()
-        if self._cooling(first, config):
+    def _log_notify(self, item: PlayItem, result: str) -> None:
+        if getattr(item, "source", "") != "notify":
             return
-        self._play_locked(first.commands)
-        self._mark(first)
+        LOG.info(
+            "notify bot=%s rule=%s sound=%s result=%s",
+            item.bot or "",
+            item.rule_name,
+            item.sound or "",
+            result,
+        )
+
+    def _take_in_window(self, deadline: float) -> list:
+        with self._cv:
+            taken = []
+            kept: deque = deque()
+            for item in self._items:
+                if item.enqueued_at <= deadline:
+                    taken.append(item)
+                else:
+                    kept.append(item)
+            self._items = kept
+            return taken
+
+    def _summary_commands(self, head: PlayItem | None, config: dict, speech_n: int) -> list:
+        if head is None:
+            default = config["default"]
+            speak = bool(default.get("say")) and speech_n > 0
+            return build_commands(
+                default["sound"],
+                int(default["volume"]),
+                int(config["master_volume"]),
+                speak,
+                default.get("voice") if speak else None,
+                "",
+                "",
+                "",
+                say_text=f"and {speech_n} more" if speak else None,
+            )
+        commands = [list(head.commands[0])]
+        if speech_n > 0 and head.say:
+            voice = None
+            for command in head.commands[1:]:
+                if command and command[0] == "say" and len(command) >= 4 and command[1] == "-v":
+                    voice = command[2]
+                    break
+            spoken = f"and {speech_n} more"
+            if voice:
+                commands.append(["say", "-v", voice, spoken])
+            else:
+                commands.append(["say", spoken])
+            return commands
+        if speech_n <= 0:
+            commands.extend(list(command) for command in head.commands[1:])
+        return commands
+
+    def _handle_first(self, first: PlayItem) -> None:
         config = self.config_getter()
         threshold = int(config.get("burst_threshold", 3))
         window = float(config.get("burst_window_seconds", 5))
-        with self._cv:
-            limit = first.enqueued_at + window
-            waiting = []
-            rest: deque = deque()
-            for item in self._items:
-                if item.enqueued_at <= limit:
-                    waiting.append(item)
-                else:
-                    rest.append(item)
-            overflow = self._overflow
-            total = 1 + len(waiting) + overflow
-            if total > threshold and (waiting or overflow):
-                self._items = rest
-                self._overflow = 0
-                collapsed = waiting
-                extra = overflow
-                normal: list = []
-            else:
-                self._items = rest
-                normal = waiting
-                collapsed = []
-                extra = 0
-        if collapsed or extra:
-            self._play_locked(collapse_commands(config, collapsed, len(collapsed) + extra))
-            return
-        for item in normal:
-            fresh = self.config_getter()
-            if self._cooling(item, fresh):
+        deadline = first.enqueued_at + window
+        goal = max(threshold - 1, 0)
+        batch = [first]
+        played = 0
+        while played < goal:
+            batch.extend(self._take_in_window(deadline))
+            if not batch:
+                if self.hold_for_burst and not self._stop and self.clock() < deadline:
+                    time.sleep(0.02)
+                    continue
+                break
+            item = batch.pop(0)
+            if self._cooling(item, self.config_getter()):
+                self._log_notify(item, "skip-cooldown")
                 continue
             self._play_locked(item.commands)
             self._mark(item)
+            self._log_notify(item, "play")
+            played += 1
+        if self.hold_for_burst:
+            while not self._stop and self.clock() < deadline:
+                time.sleep(0.02)
+        batch.extend(self._take_in_window(deadline))
+        with self._cv:
+            overflow = self._overflow
+            self._overflow = 0
+        count = len(batch) + overflow
+        if count <= 0:
+            return
+        head = batch[0] if batch else None
+        self._play_locked(self._summary_commands(head, self.config_getter(), count - 1))
+        for item in batch:
+            self._log_notify(item, "collapsed")
+        LOG.info("burst collapsed (%s)", count)
 
     def _loop(self) -> None:
         while True:
@@ -2163,7 +2400,16 @@ def _play_item_from_raw(raw: dict) -> PlayItem | None:
         enqueued_at = float(raw.get("enqueued_at"))
     except (TypeError, ValueError):
         enqueued_at = time.time()
-    return PlayItem(commands, str(raw.get("rule_name") or "default"), enqueued_at, bool(raw.get("say")))
+    item = PlayItem(
+        commands,
+        str(raw.get("rule_name") or "default"),
+        enqueued_at,
+        bool(raw.get("say")),
+        sound=str(raw.get("sound") or ""),
+        bot=raw.get("bot") if isinstance(raw.get("bot"), str) else None,
+        source=str(raw.get("source") or ""),
+    )
+    return item
 
 
 def spawn_drainer(config_path: Path, state_path: Path) -> int:
@@ -2220,14 +2466,14 @@ def enqueue_notification(
         sender=bot,
     )
     sound = outcome.effective_sound or outcome.match.sound
-    LOG.info(
-        "notify bot=%s rule=%s sound=%s result=%s",
-        bot,
-        outcome.match.rule_name,
-        sound,
-        outcome.result,
-    )
     if not outcome.commands:
+        LOG.info(
+            "notify bot=%s rule=%s sound=%s result=%s",
+            bot,
+            outcome.match.rule_name,
+            sound,
+            outcome.result,
+        )
         return outcome.result
     say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
     append_notify_item(
@@ -2238,6 +2484,8 @@ def enqueue_notification(
             "sound": sound,
             "commands": outcome.commands,
             "say": bool(say),
+            "bot": bot,
+            "source": "notify",
             "enqueued_at": time.time(),
         },
     )
@@ -2272,6 +2520,7 @@ def drain_notify_queue(config_path: Path, state_path: Path, player=None, clock=N
         lock_path=lock_path_for(state_path),
         book=book,
         clock=clock,
+        hold_for_burst=True,
     )
     queue.start()
     try:
@@ -2374,11 +2623,20 @@ def _checked_master(text: str) -> int:
 
 
 def _set_success(pairs: list[str]) -> str:
-    parts = []
+    sets = []
+    unsets = []
     for pair in pairs:
-        key, _sep, value = pair.partition("=")
-        parts.append(f"{key}={value}")
-    return "set " + " ".join(parts)
+        key, sep, value = pair.partition("=")
+        if sep and value == "":
+            unsets.append(key)
+        else:
+            sets.append(f"{key}={value}" if sep else pair)
+    parts = []
+    if sets:
+        parts.append("set " + " ".join(sets))
+    if unsets:
+        parts.append("unset " + " ".join(unsets))
+    return " ".join(parts)
 
 
 def _volume_argument(text: str) -> int:
@@ -2443,7 +2701,7 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("test-rule")
     if args.play:
         names.append("play")
-    if args.notify:
+    if args.notify or getattr(args, "notify_worker", False):
         names.append("notify")
     if args.status:
         names.append("status")
@@ -2471,6 +2729,8 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("move-rule")
     if args.set:
         names.append("set")
+    if args.unset:
+        names.append("unset")
     if args.set_mode:
         names.append("set-mode")
     if args.uninstall:
@@ -2503,8 +2763,11 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     parser.add_argument("--bot", default=None, help="Sender name used to match a rule bot, for --test or --notify")
     parser.add_argument("--body", default="", help="Body used with --notify")
     parser.add_argument("--notify", action="store_true", help="Queue a notification from a bot and return")
+    parser.add_argument("--notify-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--drain-notify", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--respect-cooldown", action="store_true", help="With --test, honor the shared cooldown")
+    parser.add_argument("--respect-quiet-hours", action="store_true", help="With --test, honor quiet hours")
+    parser.add_argument("--as-live", action="store_true", help="With --test, honor quiet hours, cooldown, paused, and enabled")
     parser.add_argument("--status", action="store_true", help="Print a parseable status report")
     parser.add_argument("--pause", action="store_true", help="Set paused true and write the config")
     parser.add_argument("--resume", action="store_true", help="Set paused false and write the config")
@@ -2519,6 +2782,7 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     parser.add_argument("--move-rule", metavar="NAME", help="Move a rule to --to N (1-based)")
     parser.add_argument("--to", type=_position_argument, default=None, help="1-based position for --move-rule")
     parser.add_argument("--set", action="append", default=None, metavar="KEY=VALUE", help="Set a dotted config key. Repeatable")
+    parser.add_argument("--unset", action="append", default=None, metavar="KEY", help="Remove an optional key --set accepts")
     parser.add_argument("--set-mode", metavar="MODE", help="Set mode to watch or notify and load or unload the agent")
     parser.add_argument("--uninstall", action="store_true", help="Remove the LaunchAgent, the shim, and the installed script")
     args = parser.parse_args(argv)
@@ -2540,12 +2804,23 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     if args.respect_cooldown and "test" not in actions:
         print("--respect-cooldown is only used with --test.", file=sys.stderr)
         return 2
-    if args.notify and not args.bot:
+    if args.respect_quiet_hours and "test" not in actions:
+        print("--respect-quiet-hours is only used with --test.", file=sys.stderr)
+        return 2
+    if args.as_live and "test" not in actions:
+        print("--as-live is only used with --test.", file=sys.stderr)
+        return 2
+    if (args.notify or args.notify_worker) and not args.bot:
         print("--notify requires --bot NAME.", file=sys.stderr)
         return 2
 
     config_path = Path(args.config) if args.config is not None else default_config_path()
     state_path = Path(args.state) if args.state is not None else default_state_path()
+    set_voice_state_path(state_path)
+    if args.notify_worker:
+        delay = os.environ.get("GROKBOT_NOTIFY_WORKER_DELAY", "")
+        if delay:
+            time.sleep(float(delay))
 
     if args.drain_notify:
         if actions:
@@ -2620,7 +2895,10 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
             return 2
         if "validate" in actions:
             errors, note = validation_report(text)
-            return _print_errors(errors, note)
+            code = _print_errors(errors, note)
+            if code == 0:
+                print("ok")
+            return code
         try:
             config = parse_config_text(text)
         except ConfigError as exc:
@@ -2714,6 +2992,9 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     if "set" in actions:
         pairs = list(args.set)
         return edit_config(config_path, lambda raw: apply_settings(raw, pairs), _set_success(pairs))
+    if "unset" in actions:
+        keys = list(args.unset)
+        return edit_config(config_path, lambda raw: unset_settings(raw, keys), "unset " + " ".join(keys))
     if "set-mode" in actions:
         mode = str(args.set_mode)
         if mode not in ("watch", "notify"):
@@ -2789,35 +3070,74 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
                 LOG.info("play sound=%s result=error exit %s", args.play, code)
             return code
         match = classify(args.title, args.subtitle, args.test, config, args.bot)
-        problem = sound_problem(match.sound, active_sounds_dir())
-        if problem:
-            print(problem, file=sys.stderr)
-            LOG.info("test rule=%s sound=%s result=error %s", match.rule_name, match.sound, problem)
-            return 2
-        if args.respect_cooldown:
+        now = datetime.now()
+        live = bool(args.as_live)
+        honor_quiet = live or bool(args.respect_quiet_hours)
+        honor_cooldown = live or bool(args.respect_cooldown)
+        if live and not config["enabled"]:
+            print("suppressed because disabled")
+            LOG.info("test rule=%s result=suppressed", match.rule_name)
+            return 0
+        if live and config.get("paused"):
+            print("suppressed because paused")
+            LOG.info("test rule=%s result=suppressed", match.rule_name)
+            return 0
+        softened = False
+        if honor_quiet and quiet_active(now, config["quiet_hours"]):
+            if config["quiet_hours"]["mode"] == "mute":
+                print("quiet hours muted the sound")
+                LOG.info("test rule=%s result=skip-mute", match.rule_name)
+                return 0
+            softened = True
+        if honor_cooldown:
             window = float(config["cooldown_seconds"])
             previous = load_cooldowns(state_path).get(match.rule_name)
-            if window > 0 and previous is not None and (datetime.now() - previous).total_seconds() < window:
+            if window > 0 and previous is not None and (now - previous).total_seconds() < window:
                 print("suppressed by cooldown")
                 LOG.info("test rule=%s result=suppressed", match.rule_name)
                 return 0
-        outcome = Outcome(
-            match,
-            "play",
-            build_commands(
-                match.sound,
-                match.volume,
+        if softened:
+            default = config["default"]
+            sound = default["sound"]
+            volume = int(default["volume"])
+            say = bool(default["say"])
+            voice = default.get("voice")
+            say_text = None
+            outcome = Outcome(
+                match,
+                "play-soft",
+                [],
                 int(config["master_volume"]),
-                match.say,
-                match.voice,
-                args.title,
-                args.subtitle,
-                args.test,
-                say_text=match.say_text,
-                bot=match.bot or args.bot,
-            ),
+                effective_sound=sound,
+                effective_volume=volume,
+                effective_say=say,
+            )
+        else:
+            sound = match.sound
+            volume = match.volume
+            say = match.say
+            voice = match.voice
+            say_text = match.say_text
+            outcome = Outcome(match, "play", [], int(config["master_volume"]))
+        problem = sound_problem(sound, active_sounds_dir())
+        if problem:
+            print(problem, file=sys.stderr)
+            LOG.info("test rule=%s sound=%s result=error %s", match.rule_name, sound, problem)
+            return 2
+        outcome.commands = build_commands(
+            sound,
+            volume,
             int(config["master_volume"]),
+            say,
+            voice,
+            args.title,
+            args.subtitle,
+            args.test,
+            say_text=say_text,
+            bot=match.bot or args.bot,
         )
+        if softened:
+            print("quiet hours softened the sound to the default sound")
         sys.stdout.write(render_test(outcome))
         code = play_reported(outcome.commands, lock_path)
         if code == 0:

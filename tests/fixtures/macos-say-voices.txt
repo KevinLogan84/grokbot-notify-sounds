@@ -1,0 +1,8 @@
+Samantha            en_US    # Hello! My name is Samantha.
+Samantha (English (US)) en_US    # Hello! My name is Samantha.
+Flo (English (US))  en_US    # Hello! My name is Flo.
+Zoe (Premium)       en_US    # Hi! I'm Zoe.
+Evan (Enhanced)     en_US    # Hi! I'm Evan.
+Reed (English (US)) en_US    # Hello! My name is Reed.
+Reed (Enhanced)     en_US    # Hi! I'm Reed.
+Reed (Premium)      en_GB    # Hi! I'm Reed.
