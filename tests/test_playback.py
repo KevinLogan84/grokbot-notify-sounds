@@ -190,7 +190,7 @@ class ValidateTests(unittest.TestCase):
                         {"name": "Known", "contains": "a", "sound": "Tink"},
                         {"name": "Nope", "contains": "b", "sound": "Glass", "enabled": False},
                         {"name": "Missing", "contains": "c", "sound": str(missing)},
-                        {"name": "Present", "bot": "Alfred", "sound": str(present)},
+                        {"name": "Present", "bot": "Helper", "sound": str(present)},
                     ],
                 }
             )

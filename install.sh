@@ -51,7 +51,7 @@ mkdir -p "${SUPPORT}" "${LOG_DIR}" "${CONFIG_DIR}" "${BIN_DIR}"
 cp -f "${ROOT}/grokbot_notify_sounds.py" "${SCRIPT_PATH}"
 cp -f "${ROOT}/config.example.jsonc" "${CONFIG_DIR}/config.example.jsonc"
 if [[ ! -f "${CONFIG_DIR}/config.json" ]]; then
-  cp "${ROOT}/config.json" "${CONFIG_DIR}/config.json"
+  cp "${ROOT}/config.default.json" "${CONFIG_DIR}/config.json"
 fi
 
 "${PY}" - "${CONFIG_DIR}/config.json" "${MODE}" <<'PY'

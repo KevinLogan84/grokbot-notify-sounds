@@ -119,23 +119,23 @@ class ClassifyTests(unittest.TestCase):
 
     def test_bot_only_matches_title_or_subtitle_not_body(self):
         config = config_with(
-            [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}]
+            [{"name": "Helper answers", "bot": "Helper", "sound": "Glass", "volume": 80}]
         )
-        self.assertEqual(gns.classify("Hello ALFRED", "", "x", config).rule_name, "Alfred answers")
-        self.assertEqual(gns.classify("Hello", "alfred here", "x", config).rule_name, "Alfred answers")
-        self.assertEqual(gns.classify("Hello", "", "Alfred wrote this", config).rule_name, "default")
+        self.assertEqual(gns.classify("Hello HELPER", "", "x", config).rule_name, "Helper answers")
+        self.assertEqual(gns.classify("Hello", "helper here", "x", config).rule_name, "Helper answers")
+        self.assertEqual(gns.classify("Hello", "", "Helper wrote this", config).rule_name, "default")
         self.assertEqual(
-            gns.classify("Hello", "", "body", config, sender="Alfred").rule_name,
-            "Alfred answers",
+            gns.classify("Hello", "", "body", config, sender="Helper").rule_name,
+            "Helper answers",
         )
-        self.assertEqual(gns.classify("Hello ALFRED", "", "x", config).volume, 80)
+        self.assertEqual(gns.classify("Hello HELPER", "", "x", config).volume, 80)
 
     def test_bot_and_text_are_anded(self):
         config = config_with(
             [
                 {
-                    "name": "Alfred shipped",
-                    "bot": "Alfred",
+                    "name": "Helper shipped",
+                    "bot": "Helper",
                     "regex": "shipped|delivered",
                     "match_in": "body",
                     "sound": "Hero",
@@ -146,18 +146,18 @@ class ClassifyTests(unittest.TestCase):
                 {"name": "Needs approval", "contains": "approve", "sound": "Sosumi"},
             ]
         )
-        hit = gns.classify("Alfred", "", "we shipped it", config)
-        self.assertEqual(hit.rule_name, "Alfred shipped")
+        hit = gns.classify("Helper", "", "we shipped it", config)
+        self.assertEqual(hit.rule_name, "Helper shipped")
         self.assertTrue(hit.say)
         self.assertEqual(hit.voice, "Zarvox")
-        self.assertEqual(gns.classify("Note from Alfred", "", "hello", config).rule_name, "default")
+        self.assertEqual(gns.classify("Note from Helper", "", "hello", config).rule_name, "default")
         self.assertEqual(gns.classify("Bob", "", "shipped", config).rule_name, "default")
         self.assertEqual(
-            gns.classify("Bob", "alfred", "delivered today", config).rule_name,
-            "Alfred shipped",
+            gns.classify("Bob", "helper", "delivered today", config).rule_name,
+            "Helper shipped",
         )
         self.assertEqual(
-            gns.classify("Alfred", "", "please approve", config).rule_name,
+            gns.classify("Helper", "", "please approve", config).rule_name,
             "Needs approval",
         )
 
@@ -165,8 +165,8 @@ class ClassifyTests(unittest.TestCase):
         config = config_with(
             [
                 {
-                    "name": "Alfred shipped",
-                    "bot": "Alfred",
+                    "name": "Helper shipped",
+                    "bot": "Helper",
                     "contains": "shipped",
                     "sound": "Hero",
                 },

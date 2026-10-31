@@ -65,7 +65,7 @@ Notify mode does not install a daemon and does not need Full Disk Access. A bot 
 
 That prints the Bot line below. It does not write a LaunchAgent and it does not ask for Full Disk Access.
 
-Both modes install `~/.local/bin/grokbot-notify-sounds`, a shell shim that execs the absolute `python3` and the script in Application Support. If that directory is not on `PATH`, install prints one line saying so. The absolute path still works. Install is safe to run again. It refreshes the installed script and `config.example.jsonc`, and it copies `config.json` only when that file does not already exist. It stores `mode` (`watch` or `notify`) in the config.
+Both modes install `~/.local/bin/grokbot-notify-sounds`, a shell shim that execs the absolute `python3` and the script in Application Support. If that directory is not on `PATH`, install prints one line saying so. The absolute path still works. Install is safe to run again. It refreshes the installed script and `config.example.jsonc`, and it copies the repo's `config.default.json` to `~/.config/grokbot-sounds/config.json` only when that file does not already exist. It stores `mode` (`watch` or `notify`) in the config.
 
 ## Bot line
 
@@ -142,8 +142,8 @@ Each rule:
 
 ```json
 {
-  "name": "Alfred answers",
-  "bot": "Alfred",
+  "name": "Helper answers",
+  "bot": "Helper",
   "sound": "Glass",
   "volume": 80
 }
@@ -164,8 +164,8 @@ Each rule:
 
 ```json
 {
-  "name": "Alfred shipped",
-  "bot": "Alfred",
+  "name": "Helper shipped",
+  "bot": "Helper",
   "regex": "shipped|delivered",
   "match_in": "body",
   "sound": "Hero",
@@ -175,7 +175,7 @@ Each rule:
 }
 ```
 
-`config.example.jsonc` lists those three rules with speech left off and the specific Alfred rule first, so a shipped note is not swallowed by the broader Alfred rule. The JSON above is the hand edit that turns speech on.
+`config.example.jsonc` lists those three rules with speech left off and the specific Helper rule first, so a shipped note is not swallowed by the broader Helper rule. The JSON above is the hand edit that turns speech on.
 
 Custom file, quiet hours, and cooldown:
 
@@ -222,7 +222,7 @@ Edits reload on the next poll when the file mtime changes. A command that rewrit
 Speech is per rule, not global. Turn it on with a merge, or by editing the rule:
 
 ```sh
-python3 grokbot_notify_sounds.py --update-rule "Alfred shipped" '{"say": true, "voice": "Samantha"}'
+python3 grokbot_notify_sounds.py --update-rule "Helper shipped" '{"say": true, "voice": "Samantha"}'
 ```
 
 ```json
@@ -234,7 +234,7 @@ Speech stays off until you opt in. Either of these turns it on:
 
 ```sh
 python3 grokbot_notify_sounds.py --set default.say=true
-python3 grokbot_notify_sounds.py --update-rule "Alfred shipped" '{"say": true, "voice": "Samantha"}'
+python3 grokbot_notify_sounds.py --update-rule "Helper shipped" '{"say": true, "voice": "Samantha"}'
 ```
 
 `voice`, when set, must match a line from `say -v '?'`. The match is case-insensitive against the full display name or the bare name (trailing parenthetical groups stripped, so `Flo (English (US))` matches `Flo`). If several voices share a bare name, the full name wins; otherwise `(Premium)`, then `(Enhanced)`, then the plain name. The config keeps the string you set. Playback passes the listing's display name to `say -v`. Omit it and, only when `say` is true, the program picks the first installed `(Premium)` voice, preferring `en_US` then any `en_*`, then the same for `(Enhanced)`. If none of those are installed it uses the system voice and does not pass `-v`. One-time download path: System Settings > Accessibility > Spoken Content > System voice > Manage Voices. `--list-voices` prints the installed voices, tags Premium and Enhanced, and stars the auto-picked one. The same display name and locale are listed once; a different locale stays as its own line. A parsed voice list is cached next to the state file so later runs can skip `say -v '?'`. `say -v '?'` is a local process, not a network call.
@@ -283,7 +283,7 @@ Writes:
 - `--enable-rule NAME`, `--disable-rule NAME`
 - `--set-mode watch` or `--set-mode notify`
 
-Every write prints one success line, such as `added rule "Alfred answers"`, `paused`, `master volume set to 40`, `set cooldown_seconds=30`, `enabled rule "Alfred answers"`, or `mode set to notify`. A bad value, including `--set-master-volume 150`, prints one line on stderr and exits 2, with no usage text. `--set-mode` also loads or unloads `com.grokbot.notify-sounds`. If `launchctl` is missing, the mode is still saved and the line says the agent was not changed.
+Every write prints one success line, such as `added rule "Helper answers"`, `paused`, `master volume set to 40`, `set cooldown_seconds=30`, `enabled rule "Helper answers"`, or `mode set to notify`. A bad value, including `--set-master-volume 150`, prints one line on stderr and exits 2, with no usage text. `--set-mode` also loads or unloads `com.grokbot.notify-sounds`. If `launchctl` is missing, the mode is still saved and the line says the agent was not changed.
 
 `--uninstall` matches `./uninstall.sh`. It is idempotent, boots out `gui/$(id -u)/com.grokbot.notify-sounds` when `launchctl` exists, and removes the LaunchAgent plist, `~/Library/Application Support/GrokBotNotifySounds`, and `~/.local/bin/grokbot-notify-sounds`. It does not delete `~/.config/grokbot-sounds` or the log, and it does not prompt. When `launchctl` is missing, that step is skipped and the files are still removed.
 

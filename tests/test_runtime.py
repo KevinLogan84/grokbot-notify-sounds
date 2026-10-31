@@ -212,7 +212,7 @@ class VoiceAndSoundTests(unittest.TestCase):
             config = config_with([{"name": "A", "contains": "hello", "sound": "Glass"}])
             self.assertFalse(config["default"]["say"])
             self.assertFalse(config["rules"][0]["say"])
-            shipped = gns.parse_config_text((ROOT / "config.json").read_text(encoding="utf-8"))
+            shipped = gns.parse_config_text((ROOT / "config.default.json").read_text(encoding="utf-8"))
             self.assertFalse(shipped["default"]["say"])
             outcome = gns.plan_notification("t", "", "hello", config, now=datetime(2026, 10, 31, 12, 0), cooldowns={})
             self.assertEqual(len(outcome.commands), 1)
@@ -239,7 +239,7 @@ class VoiceAndSoundTests(unittest.TestCase):
             [
                 {
                     "name": "A",
-                    "bot": "Alfred",
+                    "bot": "Helper",
                     "sound": "Glass",
                     "say": True,
                     "say_text": "Hi {bot} {title} {body}",
@@ -254,9 +254,9 @@ class VoiceAndSoundTests(unittest.TestCase):
             talking,
             now=datetime(2026, 10, 31, 12, 0),
             cooldowns={},
-            sender="Alfred",
+            sender="Helper",
         )
-        self.assertEqual(outcome.commands[1], ["say", "-v", "Samantha", "Hi Alfred Title Body"])
+        self.assertEqual(outcome.commands[1], ["say", "-v", "Samantha", "Hi Helper Title Body"])
 
     def test_play_rejects_missing_sounds_and_returns_player_status(self):
         sounds = Path(self.tmp.name) / "sounds" if False else Path(tempfile.mkdtemp())
@@ -367,31 +367,31 @@ class EditSurfaceTests(unittest.TestCase):
 
     def test_rules_sounds_voices_and_lines(self):
         code, out, err = self._main(
-            ["--add-rule", json.dumps({"name": "Alfred answers", "bot": "Alfred", "sound": "Nope"})]
+            ["--add-rule", json.dumps({"name": "Helper answers", "bot": "Helper", "sound": "Nope"})]
         )
         self.assertEqual(code, 2, err)
         self.assertIn("unknown built-in", err)
         self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")).get("rules", []), [])
         code, out, err = self._main(
-            ["--add-rule", json.dumps({"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "voice": "Nobody"})]
+            ["--add-rule", json.dumps({"name": "Helper answers", "bot": "Helper", "sound": "Glass", "voice": "Nobody"})]
         )
         self.assertEqual(code, 2)
         self.assertIn("unknown voice", err)
         code, out, err = self._main(
-            ["--add-rule", json.dumps({"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "say_text": "Hi {bot}"})]
+            ["--add-rule", json.dumps({"name": "Helper answers", "bot": "Helper", "sound": "Glass", "say_text": "Hi {bot}"})]
         )
         self.assertEqual(code, 0, err)
-        self.assertEqual(out.strip(), 'added rule "Alfred answers"')
+        self.assertEqual(out.strip(), 'added rule "Helper answers"')
         code, out, err = self._main(
-            ["--update-rule", "Alfred answers", json.dumps({"voice": "Missing Voice"})]
+            ["--update-rule", "Helper answers", json.dumps({"voice": "Missing Voice"})]
         )
         self.assertEqual(code, 2)
         self.assertNotIn("voice", json.loads(self.config.read_text(encoding="utf-8"))["rules"][0])
-        code, out, err = self._main(["--enable-rule", "Alfred answers"])
-        self.assertEqual(out.strip(), 'enabled rule "Alfred answers"')
-        code, out, err = self._main(["--disable-rule", "Alfred answers"])
+        code, out, err = self._main(["--enable-rule", "Helper answers"])
+        self.assertEqual(out.strip(), 'enabled rule "Helper answers"')
+        code, out, err = self._main(["--disable-rule", "Helper answers"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(out.strip(), 'disabled rule "Alfred answers"')
+        self.assertEqual(out.strip(), 'disabled rule "Helper answers"')
         self.assertFalse(json.loads(self.config.read_text(encoding="utf-8"))["rules"][0]["enabled"])
         code, _out, err = self._main(["--enable-rule", "Missing"])
         self.assertEqual(code, 2)
@@ -513,7 +513,7 @@ class NotifyTests(unittest.TestCase):
                     "burst_window_seconds": 1.5,
                     "queue_max": 20,
                     "default": {"sound": "Tink", "volume": 40, "say": False},
-                    "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}],
+                    "rules": [{"name": "Helper answers", "bot": "Helper", "sound": "Glass", "volume": 80}],
                 }
             ),
             encoding="utf-8",
@@ -563,7 +563,7 @@ class NotifyTests(unittest.TestCase):
 
         gns.connect_readonly = boom
         code, out, err = self._main(
-            ["--notify", "--bot", "Alfred", "--title", "status", "--body", "hello", "--db", str(self.root / "no-db")]
+            ["--notify", "--bot", "Helper", "--title", "status", "--body", "hello", "--db", str(self.root / "no-db")]
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(out, "")
@@ -571,8 +571,8 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(len(self.played), 1)
         self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
         text = self.log.read_text(encoding="utf-8")
-        self.assertIn("notify bot=Alfred", text)
-        self.assertIn("rule=Alfred answers", text)
+        self.assertIn("notify bot=Helper", text)
+        self.assertIn("rule=Helper answers", text)
         self.assertIn("sound=Glass", text)
         self.assertNotIn("hello", text)
 
@@ -582,14 +582,14 @@ class NotifyTests(unittest.TestCase):
                 {
                     "quiet_hours": {"enabled": True, "start": "22:00", "end": "07:00", "mode": "mute"},
                     "default": {"sound": "Tink", "volume": 40},
-                    "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass"}],
+                    "rules": [{"name": "Helper answers", "bot": "Helper", "sound": "Glass"}],
                 }
             ),
             encoding="utf-8",
         )
         before = len(self.played)
         spawned = len(self.spawned)
-        code, _out, err = self._main(["--notify", "--bot", "Alfred", "--title", "night"])
+        code, _out, err = self._main(["--notify", "--bot", "Helper", "--title", "night"])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.played), before)
         self.assertEqual(len(self.spawned), spawned)
@@ -652,15 +652,15 @@ class NotifyTests(unittest.TestCase):
                     "cooldown_seconds": 120,
                     "burst_window_seconds": 0.3,
                     "default": {"sound": "Tink", "volume": 40},
-                    "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass"}],
+                    "rules": [{"name": "Helper answers", "bot": "Helper", "sound": "Glass"}],
                 }
             ),
             encoding="utf-8",
         )
-        code, _out, err = self._main(["--notify", "--bot", "Alfred", "--body", "first"])
+        code, _out, err = self._main(["--notify", "--bot", "Helper", "--body", "first"])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.played), 1)
-        code, _out, err = self._main(["--notify", "--bot", "Alfred", "--body", "second secret body"])
+        code, _out, err = self._main(["--notify", "--bot", "Helper", "--body", "second secret body"])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.played), 1)
         self.assertIn("skip-cooldown", self.log.read_text(encoding="utf-8"))
@@ -695,10 +695,10 @@ class NotifyTests(unittest.TestCase):
         state = self.root / "cursor.json"
         config = config_with(
             [{"name": "Needs approval", "contains": "approve", "sound": "Sosumi", "volume": 100}],
-            notify_bots=["Alfred"],
+            notify_bots=["Helper"],
         )
         gns.poll_once(db, config, state, {}, lambda: datetime(2026, 10, 31, 12, 0), play=self.played.append)
-        insert_record(db, 2, 1, title="Note from Alfred", body="please approve SECRET")
+        insert_record(db, 2, 1, title="Note from Helper", body="please approve SECRET")
         insert_record(db, 3, 1, title="Other", body="please approve")
         gns.poll_once(db, config, state, {}, lambda: datetime(2026, 10, 31, 12, 0), play=self.played.append)
         self.assertEqual(len(self.played), 1)
@@ -707,7 +707,7 @@ class NotifyTests(unittest.TestCase):
 
     def test_invalid_notify_does_not_detach(self):
         self.config.write_text("{", encoding="utf-8")
-        code, out, err = self._main(["--notify", "--bot", "Alfred"])
+        code, out, err = self._main(["--notify", "--bot", "Helper"])
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertNotIn("usage:", err.lower())
@@ -1011,7 +1011,7 @@ class QuietTestTests(unittest.TestCase):
                     "cooldown_seconds": 0,
                     "quiet_hours": {"enabled": True, "start": start, "end": end, "mode": "mute"},
                     "default": {"sound": "Tink", "volume": 40, "say": False},
-                    "rules": [{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}],
+                    "rules": [{"name": "Helper answers", "bot": "Helper", "sound": "Glass", "volume": 80}],
                 }
             ),
             encoding="utf-8",
@@ -1028,7 +1028,7 @@ class QuietTestTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_test_honors_quiet_hours_and_cooldown(self):
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper"])
         self.assertEqual(code, 0, err)
         self.assertIn("result=muted", out)
         self.assertIn("result=muted", self.log.read_text(encoding="utf-8"))
@@ -1037,7 +1037,7 @@ class QuietTestTests(unittest.TestCase):
         data = json.loads(self.config.read_text(encoding="utf-8"))
         data["quiet_hours"]["mode"] = "soft"
         self.config.write_text(json.dumps(data), encoding="utf-8")
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper"])
         self.assertEqual(code, 0, err)
         self.assertIn("result=soft", out)
         self.assertIn("sound: Tink", out)
@@ -1045,7 +1045,7 @@ class QuietTestTests(unittest.TestCase):
         self.assertEqual(len(self.played), 1)
         self.assertTrue(self.played[0][0][3].endswith("/Tink.aiff"))
 
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--ignore-quiet-hours"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper", "--ignore-quiet-hours"])
         self.assertEqual(code, 0, err)
         self.assertIn("sound: Glass", out)
         self.assertNotIn("result=soft", out)
@@ -1057,15 +1057,15 @@ class QuietTestTests(unittest.TestCase):
         if self.state.exists():
             self.state.unlink()
         self.played.clear()
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper"])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.played), 1)
         self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper"])
         self.assertEqual(code, 0, err)
         self.assertIn("suppressed by cooldown", out)
         self.assertEqual(len(self.played), 1)
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--ignore-cooldown"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Helper", "--ignore-cooldown"])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.played), 2)
         self.assertTrue(self.played[-1][0][3].endswith("/Glass.aiff"))
@@ -1074,7 +1074,7 @@ class QuietTestTests(unittest.TestCase):
         data["quiet_hours"]["mode"] = "mute"
         self.config.write_text(json.dumps(data), encoding="utf-8")
         code, out, err = self._main(
-            ["--test", "hello", "--bot", "Alfred", "--ignore-quiet-hours", "--ignore-cooldown"]
+            ["--test", "hello", "--bot", "Helper", "--ignore-quiet-hours", "--ignore-cooldown"]
         )
         self.assertEqual(code, 0, err)
         self.assertIn("sound: Glass", out)
@@ -1130,7 +1130,7 @@ class NotifyParentTests(unittest.TestCase):
                 str(ROOT / "grokbot_notify_sounds.py"),
                 "--notify",
                 "--bot",
-                "Alfred",
+                "Helper",
                 "--config",
                 str(config),
                 "--state",
@@ -1154,7 +1154,7 @@ class NotifyParentTests(unittest.TestCase):
                 str(ROOT / "grokbot_notify_sounds.py"),
                 "--notify",
                 "--bot",
-                "Alfred",
+                "Helper",
                 "--title",
                 "hi",
                 "--config",

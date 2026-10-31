@@ -63,7 +63,7 @@ class EditTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_main(
-            ["--add-rule", json.dumps({"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80})]
+            ["--add-rule", json.dumps({"name": "Helper answers", "bot": "Helper", "sound": "Glass", "volume": 80})]
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_main(
@@ -71,8 +71,8 @@ class EditTests(unittest.TestCase):
                 "--add-rule",
                 json.dumps(
                     {
-                        "name": "Alfred shipped",
-                        "bot": "Alfred",
+                        "name": "Helper shipped",
+                        "bot": "Helper",
                         "regex": "shipped|delivered",
                         "sound": "Hero",
                         "volume": 60,
@@ -82,20 +82,20 @@ class EditTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         names = [rule["name"] for rule in self.load()["rules"]]
-        self.assertEqual(names, ["Needs approval", "Alfred answers", "Alfred shipped"])
+        self.assertEqual(names, ["Needs approval", "Helper answers", "Helper shipped"])
         self.assertEqual(self.load()["note"], "keep-me")
         self.assertEqual(list(self.path.parent.glob(f".{self.path.name}.*.tmp")), [])
 
         before = self.path.read_bytes()
         code, _out, err = self.run_main(
-            ["--add-rule", json.dumps({"name": "Alfred answers", "contains": "x", "sound": "Ping"})]
+            ["--add-rule", json.dumps({"name": "Helper answers", "contains": "x", "sound": "Ping"})]
         )
         self.assertEqual(code, 2)
         self.assertIn("Duplicate rule name", err)
         self.assertEqual(self.path.read_bytes(), before)
 
         code, _out, err = self.run_main(
-            ["--update-rule", "Alfred answers", json.dumps({"volume": 70, "bot": None, "contains": "hello"})]
+            ["--update-rule", "Helper answers", json.dumps({"volume": 70, "bot": None, "contains": "hello"})]
         )
         self.assertEqual(code, 0, err)
         updated = self.load()["rules"][1]
@@ -105,17 +105,17 @@ class EditTests(unittest.TestCase):
 
         before = self.path.read_bytes()
         code, _out, err = self.run_main(
-            ["--update-rule", "Needs approval", json.dumps({"name": "Alfred shipped"})]
+            ["--update-rule", "Needs approval", json.dumps({"name": "Helper shipped"})]
         )
         self.assertEqual(code, 2)
         self.assertIn("Duplicate rule name", err)
         self.assertEqual(self.path.read_bytes(), before)
 
-        code, _out, err = self.run_main(["--move-rule", "Alfred shipped", "--to", "1"])
+        code, _out, err = self.run_main(["--move-rule", "Helper shipped", "--to", "1"])
         self.assertEqual(code, 0, err)
         self.assertEqual(
             [rule["name"] for rule in self.load()["rules"]],
-            ["Alfred shipped", "Needs approval", "Alfred answers"],
+            ["Helper shipped", "Needs approval", "Helper answers"],
         )
 
         before = self.path.read_bytes()
@@ -123,7 +123,7 @@ class EditTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("No rule named", err)
         self.assertEqual(self.path.read_bytes(), before)
-        code, _out, err = self.run_main(["--move-rule", "Alfred shipped", "--to", "4"])
+        code, _out, err = self.run_main(["--move-rule", "Helper shipped", "--to", "4"])
         self.assertEqual(code, 2)
         self.assertEqual(self.path.read_bytes(), before)
 
@@ -131,7 +131,7 @@ class EditTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(
             [rule["name"] for rule in self.load()["rules"]],
-            ["Alfred shipped", "Alfred answers"],
+            ["Helper shipped", "Helper answers"],
         )
         before = self.path.read_bytes()
         code, _out, err = self.run_main(["--remove-rule", "Needs approval"])
@@ -245,15 +245,15 @@ class EditTests(unittest.TestCase):
     def test_test_bot_does_not_need_the_title(self):
         self.path.write_text(
             json.dumps(
-                document([{"name": "Alfred answers", "bot": "Alfred", "sound": "Glass", "volume": 80}])
+                document([{"name": "Helper answers", "bot": "Helper", "sound": "Glass", "volume": 80}])
             ),
             encoding="utf-8",
         )
         code, out, err = self.run_main(
-            ["--test", "hello", "--bot", "Alfred", "--state", str(Path(self.tmp.name) / "state.json")]
+            ["--test", "hello", "--bot", "Helper", "--state", str(Path(self.tmp.name) / "state.json")]
         )
         self.assertEqual(code, 0, err)
-        self.assertIn("rule: Alfred answers", out)
+        self.assertIn("rule: Helper answers", out)
         self.assertIn("afplay_volume: 0.4", out)
         self.assertEqual(self.played[0][0][2], "0.4")
 

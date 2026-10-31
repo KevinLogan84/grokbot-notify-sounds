@@ -81,7 +81,7 @@ class CursorTests(unittest.TestCase):
         self.assertEqual(self.played, [])
         self.assertEqual(read_state(self.state), 1)
 
-        insert_record(self.db, 5, 1, title="Alfred", body="please approve")
+        insert_record(self.db, 5, 1, title="Helper", body="please approve")
         self.poll()
         self.assertEqual(len(self.played), 1)
         self.assertEqual(self.played[0][0][0], "afplay")
@@ -266,8 +266,8 @@ class CliTests(unittest.TestCase):
                             "enabled": False,
                         },
                         {
-                            "name": "Alfred answers",
-                            "bot": "Alfred",
+                            "name": "Helper answers",
+                            "bot": "Helper",
                             "sound": "Glass",
                             "volume": 80,
                         },
@@ -285,7 +285,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("name=Needs approval", listed[0])
         self.assertIn("sound=Sosumi", listed[0])
         self.assertIn("enabled=false", listed[0])
-        self.assertIn("name=Alfred answers", listed[1])
+        self.assertIn("name=Helper answers", listed[1])
         self.assertIn("sound=Glass", listed[1])
         self.assertIn("volume=80", listed[1])
 
@@ -306,11 +306,11 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             code = gns.main(
-                ["--test", "status update", "--title", "Alfred", "--config", str(path), "--state", str(self.root / "state.json")],
+                ["--test", "status update", "--title", "Helper", "--config", str(path), "--state", str(self.root / "state.json")],
                 log_path=self.log_path,
             )
         self.assertEqual(code, 0)
-        self.assertIn("rule: Alfred answers", out.getvalue())
+        self.assertIn("rule: Helper answers", out.getvalue())
         self.assertIn("result: play", out.getvalue())
         self.assertEqual(self.played[0][0][:3], ["afplay", "-v", "0.4"])
         self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))

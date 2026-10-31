@@ -53,8 +53,8 @@
   "rules": [
     {
       // Bot plus text. Both must match.
-      "name": "Alfred shipped",
-      "bot": "Alfred",
+      "name": "Helper shipped",
+      "bot": "Helper",
       "regex": "shipped|delivered",
       "match_in": "body",
       "sound": "Hero",
@@ -69,8 +69,8 @@
     },
     {
       // Bot only. Case-insensitive substring of the title or the subtitle.
-      "name": "Alfred answers",
-      "bot": "Alfred",
+      "name": "Helper answers",
+      "bot": "Helper",
       "sound": "Glass",
       "volume": 80,
     },

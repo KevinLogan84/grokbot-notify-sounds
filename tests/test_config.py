@@ -22,7 +22,7 @@ class ListHandler(logging.Handler):
 
 class ConfigTests(unittest.TestCase):
     def test_shipped_config_is_strict_json_and_has_no_rules(self):
-        text = (ROOT / "config.json").read_text(encoding="utf-8")
+        text = (ROOT / "config.default.json").read_text(encoding="utf-8")
         json.loads(text)
         config = gns.parse_config_text(text)
         self.assertEqual(config["rules"], [])
@@ -43,10 +43,10 @@ class ConfigTests(unittest.TestCase):
         config = gns.parse_config_text(text)
         self.assertEqual(
             [rule["name"] for rule in config["rules"]],
-            ["Alfred shipped", "Needs approval", "Alfred answers"],
+            ["Helper shipped", "Needs approval", "Helper answers"],
         )
         shipped, approval, answers = config["rules"]
-        self.assertEqual(shipped["bot"], "Alfred")
+        self.assertEqual(shipped["bot"], "Helper")
         self.assertEqual(shipped["regex"], "shipped|delivered")
         self.assertEqual(shipped["match_in"], "body")
         self.assertEqual(shipped["sound"], "Hero")
@@ -57,7 +57,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(approval["bot"])
         self.assertEqual(approval["sound"], "Sosumi")
         self.assertIsNone(approval["volume"])
-        self.assertEqual(answers["bot"], "Alfred")
+        self.assertEqual(answers["bot"], "Helper")
         self.assertIsNone(answers["contains"])
         self.assertIsNone(answers["regex"])
         self.assertEqual(answers["sound"], "Glass")
