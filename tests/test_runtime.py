@@ -38,7 +38,7 @@ def glass_item(name, at, say=False):
 
 class QueueTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.lock = Path(self.tmp.name) / "state" / "playback.lock"
         self.state = Path(self.tmp.name) / "state" / "state.json"
@@ -287,7 +287,7 @@ class VoiceAndSoundTests(unittest.TestCase):
         self.assertIn("playback failed", err)
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.config = Path(self.tmp.name) / "config.json"
         self.config.write_text(
@@ -306,7 +306,7 @@ class VoiceAndSoundTests(unittest.TestCase):
 
 class EditSurfaceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -487,7 +487,7 @@ class EditSurfaceTests(unittest.TestCase):
 
 class NotifyTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -717,7 +717,7 @@ class InstallTests(unittest.TestCase):
     def test_install_modes_and_uninstall_shim(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## Bot line\n\n" + BOT_LINE + "\n", readme)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             home = Path(tmp) / "home"
             stub = Path(tmp) / "stub"
             home.mkdir()
@@ -784,7 +784,7 @@ class InstallTests(unittest.TestCase):
 
 class ModeTests(unittest.TestCase):
     def test_set_mode_without_launchctl(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             config = root / "config.json"
             config.write_text("{}\n", encoding="utf-8")
@@ -827,7 +827,7 @@ def _quiet_window(now):
 
 class VoiceMatchTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -946,7 +946,7 @@ class VoiceMatchTests(unittest.TestCase):
 
 class NotifyBotSetTests(unittest.TestCase):
     def test_middle_dot_and_status(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             config = root / "config.json"
             state = root / "state.json"
@@ -990,7 +990,7 @@ class NotifyBotSetTests(unittest.TestCase):
 
 class QuietTestTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = self.root / "config.json"
@@ -1089,7 +1089,7 @@ class NotifyParentTests(unittest.TestCase):
         self.assertIn("--bot", err.getvalue())
 
     def _home(self):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         home = Path(tmp.name)
         config = home / "config.json"
@@ -1269,7 +1269,7 @@ class BurstProcessTests(unittest.TestCase):
 
         handler = Grab()
         gns.LOG.addHandler(handler)
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         lock = Path(tmp.name) / "playback.lock"
         config = config_with([], burst_threshold=3, burst_window_seconds=5, queue_max=20)
@@ -1333,7 +1333,7 @@ class DedupeProcessTests(unittest.TestCase):
         self.assertEqual(gns.dedupe_window_seconds(disabled), 0.0)
 
     def _layout(self):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
         home = Path(tmp.name)
         config = home / "config.json"

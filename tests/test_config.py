@@ -169,7 +169,7 @@ class ConfigTests(unittest.TestCase):
         handler = ListHandler()
         gns.LOG.addHandler(handler)
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 path = Path(tmp) / "config.json"
                 path.write_text(
                     json.dumps(
@@ -225,7 +225,7 @@ class ConfigTests(unittest.TestCase):
         handler = ListHandler()
         gns.LOG.addHandler(handler)
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 path = Path(tmp) / "config.json"
                 path.write_text("{", encoding="utf-8")
                 source = gns.ConfigSource(path)

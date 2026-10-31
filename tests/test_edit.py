@@ -27,7 +27,7 @@ def document(rules=None, **extra):
 
 class EditTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "config.json"
         self.log_path = Path(self.tmp.name) / "agent.log"
