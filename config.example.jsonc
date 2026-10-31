@@ -2,6 +2,9 @@
   // Master switch. false still advances the cursor and plays nothing.
   "enabled": true,
 
+  // Separate from enabled. true plays nothing and speaks nothing, and still advances the cursor.
+  "paused": false,
+
   // Seconds between Notification Center polls. Must be greater than 0.
   "poll_interval_seconds": 2,
 

@@ -148,8 +148,9 @@ class ConfigTests(unittest.TestCase):
                     "quiet_hours": {"enabled": True, "start": "22:00", "end": "07:00", "mode": "loud"},
                 }
             )
-        with self.assertRaises(gns.ConfigError):
-            gns.normalize_config({"default": {"sound": "Tink"}, "bots": []})
+        ignored = gns.normalize_config({"default": {"sound": "Tink"}, "bots": []})
+        self.assertEqual(ignored["rules"], [])
+        self.assertNotIn("bots", ignored)
         with self.assertRaises(gns.ConfigError):
             gns.normalize_config(
                 {

@@ -119,6 +119,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(gns.classify("Hello ALFRED", "", "x", config).rule_name, "Alfred answers")
         self.assertEqual(gns.classify("Hello", "alfred here", "x", config).rule_name, "Alfred answers")
         self.assertEqual(gns.classify("Hello", "", "Alfred wrote this", config).rule_name, "default")
+        self.assertEqual(
+            gns.classify("Hello", "", "body", config, sender="Alfred").rule_name,
+            "Alfred answers",
+        )
         self.assertEqual(gns.classify("Hello ALFRED", "", "x", config).volume, 80)
 
     def test_bot_and_text_are_anded(self):

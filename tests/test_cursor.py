@@ -208,6 +208,21 @@ class CursorTests(unittest.TestCase):
         self.assertIn("Sosumi", text)
         self.assertNotIn(token, text)
 
+    def test_pause_advances_last_seen_without_playing(self):
+        insert_record(self.db, 1, 1, body="seed")
+        self.poll()
+        paused = config_with(
+            [{"name": "Needs approval", "contains": "approve", "sound": "Sosumi", "say": True}],
+            paused=True,
+        )
+        insert_record(self.db, 2, 1, title="Hello", body="please approve")
+        self.poll(paused)
+        self.assertEqual(self.played, [])
+        self.assertEqual(read_state(self.state), 2)
+        self.poll()
+        self.assertEqual(self.played, [])
+        self.assertEqual(read_state(self.state), 2)
+
     def test_list_bundle_ids_are_sorted(self):
         conn = gns.connect_readonly(self.db)
         try:
