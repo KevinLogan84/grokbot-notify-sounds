@@ -151,9 +151,9 @@ class ClassifyTests(unittest.TestCase):
         self.assertTrue(hit.say)
         self.assertEqual(hit.voice, "Zarvox")
         self.assertEqual(gns.classify("Note from Helper", "", "hello", config).rule_name, "default")
-        self.assertEqual(gns.classify("Bob", "", "shipped", config).rule_name, "default")
+        self.assertEqual(gns.classify("Someone", "", "shipped", config).rule_name, "default")
         self.assertEqual(
-            gns.classify("Bob", "helper", "delivered today", config).rule_name,
+            gns.classify("Someone", "helper", "delivered today", config).rule_name,
             "Helper shipped",
         )
         self.assertEqual(
@@ -173,7 +173,7 @@ class ClassifyTests(unittest.TestCase):
                 {"name": "Needs approval", "contains": "approve", "sound": "Sosumi"},
             ]
         )
-        self.assertEqual(gns.classify("Bob", "", "please approve", config).rule_name, "Needs approval")
+        self.assertEqual(gns.classify("Someone", "", "please approve", config).rule_name, "Needs approval")
 
     def test_category_does_not_change_order(self):
         config = config_with(
