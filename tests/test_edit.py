@@ -37,6 +37,10 @@ class EditTests(unittest.TestCase):
         self.played = []
         gns.play_commands = self.played.append
         gns.probe_agent = lambda: "unknown"
+        gns.set_voice_listing(
+            "Zarvox               en_US    # Zarvox\nSamantha             en_US    # Hello\n"
+        )
+        self.addCleanup(gns.clear_voice_listing)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -86,7 +90,7 @@ class EditTests(unittest.TestCase):
         code, _out, err = self.run_main(
             ["--add-rule", json.dumps({"name": "Alfred answers", "contains": "x", "sound": "Ping"})]
         )
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("Duplicate rule name", err)
         self.assertEqual(self.path.read_bytes(), before)
 
@@ -103,7 +107,7 @@ class EditTests(unittest.TestCase):
         code, _out, err = self.run_main(
             ["--update-rule", "Needs approval", json.dumps({"name": "Alfred shipped"})]
         )
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("Duplicate rule name", err)
         self.assertEqual(self.path.read_bytes(), before)
 
@@ -116,11 +120,11 @@ class EditTests(unittest.TestCase):
 
         before = self.path.read_bytes()
         code, _out, err = self.run_main(["--move-rule", "Missing", "--to", "1"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("No rule named", err)
         self.assertEqual(self.path.read_bytes(), before)
         code, _out, err = self.run_main(["--move-rule", "Alfred shipped", "--to", "4"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(self.path.read_bytes(), before)
 
         code, _out, err = self.run_main(["--remove-rule", "Needs approval"])
@@ -131,7 +135,7 @@ class EditTests(unittest.TestCase):
         )
         before = self.path.read_bytes()
         code, _out, err = self.run_main(["--remove-rule", "Needs approval"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_set_quiet_hours_cooldown_and_preserves_unknown_keys(self):
@@ -179,7 +183,7 @@ class EditTests(unittest.TestCase):
         self.assertEqual(self.load()["master_volume"], 80)
         before = self.path.read_bytes()
         code, _out, _err = self.run_main(["--set", "master_volume=50.5"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_missing_file_is_created_from_defaults(self):
@@ -235,7 +239,7 @@ class EditTests(unittest.TestCase):
         self.assertIn("afplay_volume: 0.4", out)
         self.assertEqual(self.played[0][0][0], "afplay")
         code, _out, err = self.run_main(["--test-rule", "Missing"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("No rule named", err)
 
     def test_test_bot_does_not_need_the_title(self):
@@ -245,7 +249,9 @@ class EditTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        code, out, err = self.run_main(["--test", "hello", "--bot", "Alfred"])
+        code, out, err = self.run_main(
+            ["--test", "hello", "--bot", "Alfred", "--state", str(Path(self.tmp.name) / "state.json")]
+        )
         self.assertEqual(code, 0, err)
         self.assertIn("rule: Alfred answers", out)
         self.assertIn("afplay_volume: 0.4", out)

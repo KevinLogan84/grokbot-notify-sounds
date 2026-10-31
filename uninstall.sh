@@ -7,6 +7,7 @@ launchctl bootout "gui/${UID_NUM}/com.grokbot.notify-sounds" 2>/dev/null || true
 
 rm -f "${HOME}/Library/LaunchAgents/com.grokbot.notify-sounds.plist"
 rm -rf "${HOME}/Library/Application Support/GrokBotNotifySounds"
+rm -f "${HOME}/.local/bin/grokbot-notify-sounds"
 
 echo "Removed the LaunchAgent and ~/Library/Application Support/GrokBotNotifySounds."
 echo "Left the config and the log in place. To remove those by hand:"

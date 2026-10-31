@@ -100,7 +100,12 @@ class ClassifyTests(unittest.TestCase):
         )
         self.assertEqual(gns.classify("", "", "shipped", config).rule_name, "On")
         lines = gns.format_rule_lines(config)
-        self.assertEqual(lines, ["Off: Basso", "On: Glass"])
+        self.assertTrue(lines[0].startswith("1 "))
+        self.assertIn("name=Off", lines[0])
+        self.assertIn("sound=Basso", lines[0])
+        self.assertIn("enabled=false", lines[0])
+        self.assertIn("name=On", lines[1])
+        self.assertIn("sound=Glass", lines[1])
 
     def test_default_when_nothing_matches(self):
         config = config_with(

@@ -16,7 +16,16 @@
 
   // Per-rule silence after a play, in seconds. 0 turns cooldown off.
   // A skipped play does not reset the window. Keyed by rule name.
+  // Last-played times are stored in the state file.
   "cooldown_seconds": 0,
+
+  // After the first sound in a burst finishes, more than this many items
+  // enqueued inside burst_window_seconds collapse into one extra default sound.
+  "burst_threshold": 3,
+  "burst_window_seconds": 5,
+
+  // Waiting items past this cap are counted into the collapse instead of queued.
+  "queue_max": 20,
 
   // Local time. If start is later than end, the window wraps midnight.
   // mute: no sound and no speech. soft: default sound only, and speech only if default.say is true.
@@ -28,6 +37,7 @@
   },
 
   // Fallback when nothing matches. Rule volume falls back here when a rule omits volume.
+  // Speech is off unless say is true. Omit say, or set it false.
   "default": {
     "sound": "Tink",
     "volume": 40,
@@ -45,8 +55,6 @@
       "match_in": "body",
       "sound": "Hero",
       "volume": 60,
-      "say": true,
-      "voice": "Zarvox",
     },
     {
       // Text only. A list matches if any phrase appears.

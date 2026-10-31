@@ -26,6 +26,10 @@ def plan(body, config, now, cooldowns=None, title="", subtitle="", mark=False):
 
 
 class VolumeTests(unittest.TestCase):
+    def setUp(self):
+        gns.set_voice_listing("Samantha             en_US    # Hello\n")
+        self.addCleanup(gns.clear_voice_listing)
+
     def test_formula_and_argv(self):
         config = config_with(
             [{"name": "A", "contains": "hello", "sound": "Glass", "volume": 80, "say": True, "voice": "Zarvox"}],

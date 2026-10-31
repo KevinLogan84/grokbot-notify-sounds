@@ -280,15 +280,19 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(out):
             code = gns.main(["--list-rules", "--config", str(path), "--db", str(self.root / "nope")], log_path=self.log_path)
         self.assertEqual(code, 0)
-        self.assertEqual(
-            out.getvalue().splitlines(),
-            ["Needs approval: Sosumi", "Alfred answers: Glass"],
-        )
+        listed = out.getvalue().splitlines()
+        self.assertEqual(len(listed), 2)
+        self.assertIn("name=Needs approval", listed[0])
+        self.assertIn("sound=Sosumi", listed[0])
+        self.assertIn("enabled=false", listed[0])
+        self.assertIn("name=Alfred answers", listed[1])
+        self.assertIn("sound=Glass", listed[1])
+        self.assertIn("volume=80", listed[1])
 
         err = io.StringIO()
         with redirect_stderr(err):
             code = gns.main(["--validate", "--config", str(self.root / "missing.json")], log_path=self.log_path)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("Cannot read config", err.getvalue())
 
         bad = self.root / "bad.json"
@@ -296,13 +300,13 @@ class CliTests(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err):
             code = gns.main(["--validate", "--config", str(bad)], log_path=self.log_path)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("Invalid JSON", err.getvalue())
 
         out = io.StringIO()
         with redirect_stdout(out):
             code = gns.main(
-                ["--test", "status update", "--title", "Alfred", "--config", str(path)],
+                ["--test", "status update", "--title", "Alfred", "--config", str(path), "--state", str(self.root / "state.json")],
                 log_path=self.log_path,
             )
         self.assertEqual(code, 0)
@@ -330,7 +334,10 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = gns.main(["--test", "please approve", "--config", str(path)], log_path=self.log_path)
+            code = gns.main(
+                ["--test", "please approve", "--config", str(path), "--state", str(self.root / "state.json")],
+                log_path=self.log_path,
+            )
         self.assertEqual(code, 0)
         self.assertIn("rule: Needs approval", out.getvalue())
         self.assertIn("afplay", err.getvalue())
@@ -380,14 +387,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(read_state(state), 4)
 
     def test_list_sounds_missing_directory(self):
-        if gns.SYSTEM_SOUNDS_DIR.is_dir():
-            self.skipTest("system sounds directory exists")
-        err = io.StringIO()
-        with redirect_stderr(err):
-            code = gns.main(["--list-sounds"], log_path=self.log_path)
+        config = self.root / "empty.json"
+        config.write_text("{}\n", encoding="utf-8")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = gns.main(["--list-sounds", "--config", str(config)], log_path=self.log_path)
         self.assertEqual(code, 0)
-        self.assertEqual(len(err.getvalue().splitlines()), 1)
-        self.assertIn(str(gns.SYSTEM_SOUNDS_DIR), err.getvalue())
+        self.assertIn("Glass: bright glassy chime", out.getvalue().splitlines())
 
     def test_db_candidates_start_with_the_group_container(self):
         candidates = gns.notification_db_candidates()

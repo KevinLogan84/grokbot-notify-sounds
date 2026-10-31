@@ -51,8 +51,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(shipped["match_in"], "body")
         self.assertEqual(shipped["sound"], "Hero")
         self.assertEqual(shipped["volume"], 60)
-        self.assertTrue(shipped["say"])
-        self.assertEqual(shipped["voice"], "Zarvox")
+        self.assertFalse(shipped["say"])
+        self.assertIsNone(shipped["voice"])
         self.assertEqual(approval["contains"], ["approve", "needs your OK"])
         self.assertIsNone(approval["bot"])
         self.assertEqual(approval["sound"], "Sosumi")
@@ -215,7 +215,7 @@ class ConfigTests(unittest.TestCase):
                 )
                 os.utime(path, ns=(stamp + 6_000_000_000, stamp + 6_000_000_000))
                 self.assertEqual(source.current()["rules"][0]["sound"], "Hero")
-                self.assertTrue(any("last good config" in message for message in handler.messages))
+                self.assertTrue(any("keeping last good" in message for message in handler.messages))
         finally:
             gns.LOG.removeHandler(handler)
 

@@ -8,6 +8,7 @@ never uses the network or the Keychain.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -18,7 +19,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -30,8 +33,29 @@ LOG.propagate = False
 SYSTEM_SOUNDS_DIR = Path("/System/Library/Sounds")
 CUSTOM_EXTENSIONS = (".aiff", ".mp3", ".wav", ".m4a")
 SUMMARY_LIMIT = 120
+SAY_TEXT_LIMIT = 300
 LOG_MAX_BYTES = 256 * 1024
 LOG_BACKUPS = 3
+LOCK_NAME = "playback.lock"
+_SAY_FIELDS = re.compile(r"\{(bot|title|body)\}")
+_STATE_LOCK = threading.Lock()
+
+BUILTIN_SOUND_LINES = (
+    "Basso: deep downward thud",
+    "Blow: short breathy whoosh",
+    "Bottle: hollow bottle pop",
+    "Frog: short croak",
+    "Funk: muted bass hit",
+    "Glass: bright glassy chime",
+    "Hero: short rising fanfare",
+    "Morse: quick telegraph beep",
+    "Ping: soft high ping",
+    "Pop: sharp cork pop",
+    "Purr: soft low purr",
+    "Sosumi: four-note chime",
+    "Submarine: sonar ping",
+    "Tink: short metal tink",
+)
 
 
 class ConfigError(Exception):
@@ -270,6 +294,13 @@ def _normalize_default(raw: object, errors: list[str]) -> dict:
     return default
 
 
+def _require_int(value: object, label: str, minimum: int, errors: list[str], fallback: int) -> int:
+    if type(value) is not int or value < minimum:
+        errors.append(f"{label} must be an integer >= {minimum}")
+        return fallback
+    return value
+
+
 def _normalize_contains(value: object, label: str, errors: list[str]) -> list[str] | None:
     if value is None:
         return None
@@ -364,6 +395,13 @@ def _normalize_rule(item: dict, index: int, errors: list[str]) -> dict | None:
         else:
             voice = item["voice"].strip() or None
 
+    say_text = None
+    if "say_text" in item and item["say_text"] is not None:
+        if not isinstance(item["say_text"], str):
+            errors.append(f"{label} say_text must be a string")
+        else:
+            say_text = item["say_text"]
+
     enabled = True
     if "enabled" in item:
         if not isinstance(item["enabled"], bool):
@@ -389,6 +427,7 @@ def _normalize_rule(item: dict, index: int, errors: list[str]) -> dict | None:
         "sound": sound,
         "volume": volume,
         "say": say,
+        "say_text": say_text,
         "voice": voice,
         "enabled": enabled,
         "category": category,
@@ -439,6 +478,33 @@ def normalize_config(data: object) -> dict:
         else:
             cooldown = float(raw_cooldown)
 
+    burst_threshold = 3
+    if "burst_threshold" in data:
+        burst_threshold = _require_int(data["burst_threshold"], "burst_threshold", 0, errors, 3)
+    burst_window = 5.0
+    if "burst_window_seconds" in data:
+        raw_window = data["burst_window_seconds"]
+        if not _is_finite_number(raw_window) or raw_window < 0:
+            errors.append("burst_window_seconds must be a number >= 0")
+        else:
+            burst_window = float(raw_window)
+    queue_max = 20
+    if "queue_max" in data:
+        queue_max = _require_int(data["queue_max"], "queue_max", 1, errors, 20)
+
+    mode = data.get("mode", "watch")
+    if mode not in ("watch", "notify"):
+        errors.append("mode must be 'watch' or 'notify'")
+        mode = "watch"
+
+    notify_bots: list[str] = []
+    if "notify_bots" in data and data["notify_bots"] is not None:
+        raw_bots = data["notify_bots"]
+        if not isinstance(raw_bots, list) or any(not isinstance(item, str) for item in raw_bots):
+            errors.append("notify_bots must be a list of strings")
+        else:
+            notify_bots = [item.strip() for item in raw_bots if item.strip()]
+
     quiet = _normalize_quiet(data.get("quiet_hours"), errors)
     default = _normalize_default(data.get("default"), errors)
 
@@ -471,6 +537,11 @@ def normalize_config(data: object) -> dict:
         "bundle_id": bundle_id,
         "master_volume": master,
         "cooldown_seconds": cooldown,
+        "burst_threshold": burst_threshold,
+        "burst_window_seconds": burst_window,
+        "queue_max": queue_max,
+        "mode": mode,
+        "notify_bots": notify_bots,
         "quiet_hours": quiet,
         "default": default,
         "rules": rules,
@@ -552,15 +623,12 @@ class ConfigSource:
                 )
                 self.config = builtin_defaults()
             else:
-                LOG.error(
-                    "Config file %s is invalid (%s). Keeping the last good config.",
-                    self.path,
-                    exc,
-                )
+                LOG.error("config invalid, keeping last good: %s", exc)
             self._seen_mtime = mtime
             return self.config
         self.config = loaded
         self._seen_mtime = mtime
+        LOG.info("config reloaded (%s rules)", len(loaded["rules"]))
         return self.config
 
 
@@ -620,12 +688,23 @@ def _resolved_volume(rule_volume: int | None, config: dict) -> int:
 
 
 class Match:
-    def __init__(self, rule_name: str, sound: str, volume: int, say: bool, voice: str | None):
+    def __init__(
+        self,
+        rule_name: str,
+        sound: str,
+        volume: int,
+        say: bool,
+        voice: str | None,
+        say_text: str | None = None,
+        bot: str | None = None,
+    ):
         self.rule_name = rule_name
         self.sound = sound
         self.volume = volume
         self.say = say
         self.voice = voice
+        self.say_text = say_text
+        self.bot = bot
 
 
 class Outcome:
@@ -657,6 +736,8 @@ def classify(title: str, subtitle: str, body: str, config: dict, sender: str | N
                 _resolved_volume(rule["volume"], config),
                 bool(rule["say"]),
                 rule["voice"],
+                rule.get("say_text"),
+                rule.get("bot"),
             )
     default = config["default"]
     return Match(
@@ -668,18 +749,27 @@ def classify(title: str, subtitle: str, body: str, config: dict, sender: str | N
     )
 
 
+def clip_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1] + "…"
+
+
 def summary_text(title: str, subtitle: str, body: str, limit: int = SUMMARY_LIMIT) -> str:
     parts = []
     for part in (title, subtitle, body):
         text = (part or "").strip()
         if text:
             parts.append(text)
-    joined = " ".join(parts)
-    if len(joined) <= limit:
-        return joined
-    if limit <= 1:
-        return joined[:limit]
-    return joined[: limit - 1] + "…"
+    return clip_text(" ".join(parts), limit)
+
+
+def render_say_text(template: str, bot: str, title: str, body: str) -> str:
+    values = {"bot": bot or "", "title": title or "", "body": body or ""}
+    spoken = _SAY_FIELDS.sub(lambda match: values[match.group(1)], template)
+    return clip_text(spoken, SAY_TEXT_LIMIT)
 
 
 def build_commands(
@@ -691,6 +781,8 @@ def build_commands(
     title: str,
     subtitle: str,
     body: str,
+    say_text: str | None = None,
+    bot: str | None = None,
 ) -> list[list[str]]:
     kind, ident = classify_sound(sound)
     if kind == "builtin":
@@ -698,13 +790,19 @@ def build_commands(
     else:
         path = ident
     commands = [["afplay", "-v", afplay_volume_str(volume, master), path]]
-    if say:
+    if not say:
+        return commands
+    if say_text is not None:
+        spoken = render_say_text(say_text, bot or "", title, body)
+    else:
         spoken = summary_text(title, subtitle, body)
-        if spoken:
-            if voice:
-                commands.append(["say", "-v", voice, spoken])
-            else:
-                commands.append(["say", spoken])
+    if not spoken:
+        return commands
+    chosen = voice if voice else pick_natural_voice()
+    if chosen:
+        commands.append(["say", "-v", chosen, spoken])
+    else:
+        commands.append(["say", spoken])
     return commands
 
 
@@ -754,7 +852,19 @@ def plan_notification(
         if (now - previous).total_seconds() < window:
             return skipped("skip-cooldown")
 
-    commands = build_commands(sound, volume, master, say, voice, title, subtitle, body)
+    template = None if result == "play-soft" else match.say_text
+    commands = build_commands(
+        sound,
+        volume,
+        master,
+        say,
+        voice,
+        title,
+        subtitle,
+        body,
+        say_text=template,
+        bot=match.bot,
+    )
     if mark:
         cooldowns[match.rule_name] = now
     return Outcome(
@@ -789,8 +899,30 @@ def render_test(outcome: Outcome) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _dash(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    return str(value)
+
+
+def format_rule_line(index: int, rule: dict, config: dict) -> str:
+    pieces = []
+    if rule.get("contains"):
+        pieces.append("contains:" + "|".join(rule["contains"]))
+    if rule.get("regex"):
+        pieces.append("regex:" + rule["regex"])
+    match = "+".join(pieces) if pieces else "-"
+    volume = _resolved_volume(rule.get("volume"), config)
+    return (
+        f"{index} name={rule['name']} bot={_dash(rule.get('bot'))} match={match} "
+        f"match_in={rule['match_in']} sound={rule['sound']} volume={volume} "
+        f"enabled={_format_bool(bool(rule['enabled']))} say={_format_bool(bool(rule['say']))} "
+        f"say_text={_dash(rule.get('say_text'))} voice={_dash(rule.get('voice'))}"
+    )
+
+
 def format_rule_lines(config: dict) -> list[str]:
-    return [f"{rule['name']}: {rule['sound']}" for rule in config["rules"]]
+    return [format_rule_line(index, rule, config) for index, rule in enumerate(config["rules"], start=1)]
 
 
 def iter_sounds(config: dict):
@@ -821,13 +953,25 @@ def sound_report(config: dict, sounds_dir: Path) -> tuple[list[str], str | None]
     return errors, note
 
 
-def validation_report(text: str, sounds_dir: Path | None = None) -> tuple[list[str], str | None]:
+def validation_report(
+    text: str,
+    sounds_dir: Path | None = None,
+    voice_listing: str | None = None,
+) -> tuple[list[str], str | None]:
     try:
         config = parse_config_text(text)
     except ConfigError as exc:
         return list(exc.errors), None
-    directory = SYSTEM_SOUNDS_DIR if sounds_dir is None else Path(sounds_dir)
-    return sound_report(config, directory)
+    directory = active_sounds_dir() if sounds_dir is None else Path(sounds_dir)
+    errors, note = sound_report(config, directory)
+    if not configured_voices(config):
+        return errors, note
+    if voice_listing is None:
+        voices = load_voices()
+    else:
+        voices = parse_voices(voice_listing)
+    errors.extend(voice_errors(config, voices))
+    return errors, note
 
 
 def _as_text(value: object) -> str:
@@ -942,6 +1086,35 @@ def _new_records(conn: sqlite3.Connection, bundle_id: str, last_seen: int) -> li
     return [(int(row[0]), row[1]) for row in rows]
 
 
+def _read_state_document(path: Path) -> dict:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state_document(path: Path, data: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def load_state(path: Path) -> int | None:
     path = Path(path)
     if not path.exists():
@@ -957,22 +1130,51 @@ def load_state(path: Path) -> int | None:
         return None
 
 
+def load_cooldowns(path: Path) -> dict[str, datetime]:
+    raw = _read_state_document(path).get("cooldowns")
+    found: dict[str, datetime] = {}
+    if not isinstance(raw, dict):
+        return found
+    for name, stamp in raw.items():
+        if isinstance(name, str) and type(stamp) in (int, float):
+            found[name] = datetime.fromtimestamp(float(stamp))
+    return found
+
+
 def save_state(path: Path, last_seen: int) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps({"last_seen": int(last_seen)}) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    with _STATE_LOCK:
+        data = _read_state_document(path)
+        data["last_seen"] = int(last_seen)
+        if not isinstance(data.get("cooldowns"), dict):
+            data["cooldowns"] = {}
+        _write_state_document(path, data)
+
+
+def save_cooldown(path: Path, name: str, when: datetime) -> None:
+    path = Path(path)
+    with _STATE_LOCK:
+        data = _read_state_document(path)
+        cool = data.get("cooldowns")
+        if not isinstance(cool, dict):
+            cool = {}
+        cool[str(name)] = when.timestamp()
+        data["cooldowns"] = cool
+        _write_state_document(path, data)
+
+
+class PlaybackError(Exception):
+    def __init__(self, code: int):
+        self.code = int(code)
+        super().__init__(f"playback failed (exit {self.code})")
 
 
 def play_commands(commands: list[list[str]]) -> None:
-    """Run afplay and say. Tests replace this function."""
+    """Run afplay and say, one after another. Tests replace this function."""
     for command in commands:
-        subprocess.run(command, check=False)
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            raise PlaybackError(result.returncode)
 
 
 def poll_once(
@@ -982,8 +1184,9 @@ def poll_once(
     cooldowns: dict[str, datetime],
     clock,
     play=None,
+    queue=None,
 ) -> None:
-    if play is None:
+    if play is None and queue is None:
         play = play_commands
     try:
         conn = connect_readonly(db_path)
@@ -1013,6 +1216,10 @@ def poll_once(
                 LOG.error("rec_id=%s has an unreadable notification payload", rec_id)
                 save_state(state_path, rec_id)
                 continue
+            if bot_is_notify_only(title, subtitle, config.get("notify_bots") or []):
+                LOG.info("rec_id=%s result=skip-notify-bot", rec_id)
+                save_state(state_path, rec_id)
+                continue
             try:
                 outcome = plan_notification(
                     title,
@@ -1021,10 +1228,13 @@ def poll_once(
                     config,
                     now=clock(),
                     cooldowns=cooldowns,
-                    mark=True,
+                    mark=queue is None,
                 )
                 if outcome.commands:
-                    play(outcome.commands)
+                    if queue is not None:
+                        queue.enqueue(item_from_outcome(outcome, queue.clock()))
+                    else:
+                        play(outcome.commands)
                 LOG.info(
                     "rec_id=%s rule=%s sound=%s result=%s",
                     rec_id,
@@ -1068,9 +1278,8 @@ def _print_errors(errors: list[str], note: str | None) -> int:
         print(note, file=sys.stderr)
     if not errors:
         return 0
-    for error in errors:
-        print(error, file=sys.stderr)
-    return 1
+    print("; ".join(errors), file=sys.stderr)
+    return 2
 
 
 def _load_text_or_exit(path: Path) -> str | None:
@@ -1081,13 +1290,14 @@ def _load_text_or_exit(path: Path) -> str | None:
         return None
 
 
-NULLABLE_RULE_KEYS = {"bot", "contains", "regex", "volume", "voice", "category"}
-SET_BOOL_KEYS = {"enabled", "paused", "quiet_hours.enabled"}
-SET_INT_KEYS = {"master_volume", "default.volume"}
-SET_NUMBER_KEYS = {"poll_interval_seconds", "cooldown_seconds"}
+NULLABLE_RULE_KEYS = {"bot", "contains", "regex", "volume", "voice", "category", "say_text"}
+SET_BOOL_KEYS = {"enabled", "paused", "quiet_hours.enabled", "default.say"}
+SET_INT_KEYS = {"master_volume", "default.volume", "burst_threshold", "queue_max"}
+SET_NUMBER_KEYS = {"poll_interval_seconds", "cooldown_seconds", "burst_window_seconds"}
 SET_STRING_KEYS = {
     "bundle_id",
     "default.sound",
+    "default.voice",
     "quiet_hours.start",
     "quiet_hours.end",
     "quiet_hours.mode",
@@ -1145,7 +1355,10 @@ def write_config_atomic(path: Path, data: dict) -> None:
 def commit_document(path: Path, mutator) -> dict:
     raw = load_raw_document(path)
     mutator(raw)
-    normalize_config(raw)
+    config = normalize_config(raw)
+    problems = media_errors(config)
+    if problems:
+        raise ConfigError(problems)
     write_config_atomic(path, raw)
     return raw
 
@@ -1267,12 +1480,14 @@ def parse_json_value(text: str) -> object:
         raise ConfigError([f"Invalid JSON: {exc.msg} (line {exc.lineno})"]) from exc
 
 
-def edit_config(path: Path, mutator) -> int:
+def edit_config(path: Path, mutator, success: str | None = None) -> int:
     try:
         commit_document(path, mutator)
     except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        print("; ".join(exc.errors), file=sys.stderr)
+        return 2
+    if success:
+        print(success)
     return 0
 
 
@@ -1339,6 +1554,7 @@ def render_status(
     lines = [
         f"enabled: {_format_bool(bool(config['enabled']))}",
         f"paused: {_format_bool(bool(config.get('paused', False)))}",
+        f"mode: {config.get('mode', 'watch')}",
         f"master_volume: {config['master_volume']}",
         f"poll_interval_seconds: {_format_number(config['poll_interval_seconds'])}",
         f"cooldown_seconds: {_format_number(config['cooldown_seconds'])}",
@@ -1360,11 +1576,11 @@ def load_runtime_config(path: Path) -> dict:
     return load_config(path)
 
 
-def play_reported(commands: list[list[str]]) -> int:
+def play_reported(commands: list[list[str]], lock_path: Path) -> int:
     if not commands:
         return 0
     try:
-        play_commands(commands)
+        play_with_lock(lock_path, commands, play_commands)
     except FileNotFoundError as exc:
         missing = exc.filename or "playback command"
         print(
@@ -1372,9 +1588,12 @@ def play_reported(commands: list[list[str]]) -> int:
             file=sys.stderr,
         )
         return 0
+    except PlaybackError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
     except OSError as exc:
         print(f"Playback failed ({exc}). The match is shown above.", file=sys.stderr)
-        return 0
+        return 1
     return 0
 
 
@@ -1408,14 +1627,758 @@ def uninstall_agent(home: Path | None = None, *, exists=None, run=None) -> int:
     except FileNotFoundError:
         pass
     shutil.rmtree(support, ignore_errors=True)
-    print("Removed the LaunchAgent and ~/Library/Application Support/GrokBotNotifySounds.")
-    print("Left the config and the log in place. To remove those by hand:")
-    print(f'  rm -rf "{home}/.config/grokbot-sounds"')
-    print(
-        f'  rm -f "{home}/Library/Logs/grokbot-notify-sounds.log" '
-        f'"{home}/Library/Logs/grokbot-notify-sounds.log."*'
-    )
+    shim = home / ".local" / "bin" / "grokbot-notify-sounds"
+    try:
+        shim.unlink()
+    except FileNotFoundError:
+        pass
+    print("uninstalled")
     return 0
+
+
+_SOUNDS_DIR_OVERRIDE: Path | None = None
+_VOICE_OVERRIDE_SET = False
+_VOICE_LISTING_OVERRIDE = ""
+_VOICE_CACHE: list | None = None
+_VOICE_FAILED = False
+_VOICE_LINE = re.compile(r"^(.+?)\s{2,}([A-Za-z]{2}_[A-Za-z0-9]+)\s+#\s*(.*)$")
+
+
+class Voice:
+    def __init__(self, name: str, lang: str):
+        self.name = name
+        self.lang = lang
+
+
+def set_sounds_dir(path: Path | None) -> None:
+    global _SOUNDS_DIR_OVERRIDE
+    _SOUNDS_DIR_OVERRIDE = None if path is None else Path(path)
+
+
+def active_sounds_dir() -> Path:
+    return SYSTEM_SOUNDS_DIR if _SOUNDS_DIR_OVERRIDE is None else _SOUNDS_DIR_OVERRIDE
+
+
+def set_voice_listing(text: str) -> None:
+    global _VOICE_OVERRIDE_SET, _VOICE_LISTING_OVERRIDE, _VOICE_CACHE, _VOICE_FAILED
+    _VOICE_OVERRIDE_SET = True
+    _VOICE_LISTING_OVERRIDE = text
+    _VOICE_CACHE = None
+    _VOICE_FAILED = False
+
+
+def clear_voice_listing() -> None:
+    global _VOICE_OVERRIDE_SET, _VOICE_CACHE, _VOICE_FAILED
+    _VOICE_OVERRIDE_SET = False
+    _VOICE_CACHE = None
+    _VOICE_FAILED = False
+
+
+def clear_voice_cache() -> None:
+    global _VOICE_CACHE, _VOICE_FAILED
+    _VOICE_CACHE = None
+    _VOICE_FAILED = False
+
+
+def read_voice_listing() -> str | None:
+    if _VOICE_OVERRIDE_SET:
+        return _VOICE_LISTING_OVERRIDE
+    try:
+        result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout or ""
+
+
+def parse_voices(text: str) -> list:
+    voices = []
+    for line in text.splitlines():
+        match = _VOICE_LINE.match(line.strip())
+        if match is None:
+            continue
+        voices.append(Voice(match.group(1).strip(), match.group(2)))
+    return voices
+
+
+def load_voices():
+    global _VOICE_CACHE, _VOICE_FAILED
+    if _VOICE_CACHE is not None:
+        return _VOICE_CACHE
+    if _VOICE_FAILED:
+        return None
+    text = read_voice_listing()
+    if text is None:
+        _VOICE_FAILED = True
+        return None
+    _VOICE_CACHE = parse_voices(text)
+    return _VOICE_CACHE
+
+
+def _voice_sort_key(voice: Voice, index: int):
+    if "(Premium)" in voice.name:
+        tier = 0
+    elif "(Enhanced)" in voice.name:
+        tier = 1
+    else:
+        return None
+    if voice.lang == "en_US":
+        lang = 0
+    elif str(voice.lang).startswith("en_"):
+        lang = 1
+    else:
+        return None
+    return (tier, lang, index)
+
+
+def pick_natural_voice() -> str | None:
+    voices = load_voices()
+    if not voices:
+        return None
+    ranked = []
+    for index, voice in enumerate(voices):
+        key = _voice_sort_key(voice, index)
+        if key is not None:
+            ranked.append((key, voice.name))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[0][1]
+
+
+def format_voice_report(voices: list) -> str:
+    ranked = []
+    for index, voice in enumerate(voices):
+        key = _voice_sort_key(voice, index)
+        if key is not None:
+            ranked.append((key, voice.name))
+    picked = ranked[0][1] if ranked else None
+    lines = []
+    if not any("(Premium)" in voice.name or "(Enhanced)" in voice.name for voice in voices):
+        lines.append("No Premium or Enhanced voice is installed.")
+        lines.append(
+            "Download one in System Settings > Accessibility > Spoken Content > System voice > Manage Voices."
+        )
+    for voice in voices:
+        tags = []
+        if "(Premium)" in voice.name:
+            tags.append("Premium")
+        if "(Enhanced)" in voice.name:
+            tags.append("Enhanced")
+        star = "*" if voice.name == picked else " "
+        suffix = f" [{', '.join(tags)}]" if tags else ""
+        lines.append(f"{star} {voice.name} {voice.lang}{suffix}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def sound_problem(sound: str, sounds_dir: Path) -> str | None:
+    try:
+        kind, ident = classify_sound(sound)
+    except ValueError as exc:
+        return str(exc)
+    if kind == "file":
+        if not Path(ident).is_file():
+            return f"missing sound file {ident}"
+        return None
+    if not Path(sounds_dir).is_dir():
+        return None
+    if not (Path(sounds_dir) / f"{ident}.aiff").is_file():
+        return f"unknown built-in sound {ident!r}"
+    return None
+
+
+def configured_voices(config: dict) -> list[tuple[str, str]]:
+    found = []
+    voice = config["default"].get("voice")
+    if voice:
+        found.append(("default", voice))
+    for rule in config["rules"]:
+        if rule.get("voice"):
+            found.append((rule["name"], rule["voice"]))
+    return found
+
+
+def voice_errors(config: dict, voices) -> list[str]:
+    needed = configured_voices(config)
+    if not needed:
+        return []
+    if voices is None:
+        return [
+            f"{label}: voice {name!r} could not be checked because say -v '?' failed"
+            for label, name in needed
+        ]
+    names = {voice.name for voice in voices}
+    errors = []
+    for label, name in needed:
+        if name not in names:
+            errors.append(f"{label}: unknown voice {name!r}")
+    return errors
+
+
+def media_errors(config: dict) -> list[str]:
+    errors = []
+    directory = active_sounds_dir()
+    for label, sound in iter_sounds(config):
+        problem = sound_problem(sound, directory)
+        if problem:
+            errors.append(f"{label}: {problem}")
+    if configured_voices(config):
+        errors.extend(voice_errors(config, load_voices()))
+    return errors
+
+
+def custom_sound_lines(config: dict) -> list[str]:
+    seen: list[str] = []
+    lines = []
+    for _label, sound in iter_sounds(config):
+        try:
+            kind, ident = classify_sound(sound)
+        except ValueError:
+            continue
+        if kind != "file" or ident in seen:
+            continue
+        seen.append(ident)
+        lines.append(f"{ident}: custom file")
+    return lines
+
+
+def lock_path_for(state_path: Path) -> Path:
+    return Path(state_path).parent / LOCK_NAME
+
+
+def play_with_lock(lock_path: Path, commands, player) -> None:
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            player(commands)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+class CooldownBook:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self.values = load_cooldowns(self.path)
+
+    def snapshot(self) -> dict[str, datetime]:
+        with self._lock:
+            return dict(self.values)
+
+    def mark(self, name: str, when: datetime) -> None:
+        with self._lock:
+            self.values[name] = when
+            save_cooldown(self.path, name, when)
+
+
+class PlayItem:
+    def __init__(self, commands, rule_name: str, enqueued_at: float, say: bool):
+        self.commands = commands
+        self.rule_name = rule_name
+        self.enqueued_at = enqueued_at
+        self.say = bool(say)
+
+
+def item_from_outcome(outcome, enqueued_at: float) -> PlayItem:
+    say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
+    return PlayItem(outcome.commands, outcome.match.rule_name, enqueued_at, say)
+
+
+def collapse_commands(config: dict, collapsed: list, count: int) -> list[list[str]]:
+    default = config["default"]
+    speak = bool(default.get("say")) or any(item.say for item in collapsed)
+    return build_commands(
+        default["sound"],
+        int(default["volume"]),
+        int(config["master_volume"]),
+        speak,
+        default.get("voice") if speak else None,
+        "",
+        "",
+        "",
+        say_text=f"and {count} more" if speak else None,
+    )
+
+
+class PlaybackQueue:
+    """One worker plays sound, then say, then the next item. Never in parallel."""
+
+    def __init__(self, config_getter, player, lock_path, book=None, clock=None, now=None):
+        self.config_getter = config_getter
+        self.player = player
+        self.lock_path = Path(lock_path)
+        self.book = book
+        self.clock = clock or time.monotonic
+        self.now = now or datetime.now
+        self._items: deque = deque()
+        self._overflow = 0
+        self._cv = threading.Condition()
+        self._stop = False
+        self._busy = False
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="playback", daemon=True)
+        self._thread.start()
+
+    def enqueue(self, item: PlayItem) -> None:
+        config = self.config_getter()
+        cap = int(config.get("queue_max", 20))
+        with self._cv:
+            if len(self._items) >= cap:
+                self._overflow += 1
+            else:
+                self._items.append(item)
+            self._cv.notify_all()
+
+    def idle(self) -> bool:
+        with self._cv:
+            return (not self._items) and self._overflow == 0 and not self._busy
+
+    def drain(self, timeout: float = 5) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._cv:
+                idle = (not self._items) and self._overflow == 0 and not self._busy
+            if idle:
+                return
+            time.sleep(0.005)
+        raise TimeoutError("playback queue did not drain")
+
+    def close(self) -> None:
+        try:
+            self.drain(timeout=2)
+        except TimeoutError:
+            pass
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def _cooling(self, item: PlayItem, config: dict) -> bool:
+        window = float(config.get("cooldown_seconds", 0))
+        if window <= 0 or self.book is None:
+            return False
+        previous = self.book.snapshot().get(item.rule_name)
+        if previous is None:
+            return False
+        return (self.now() - previous).total_seconds() < window
+
+    def _play_locked(self, commands) -> None:
+        play_with_lock(self.lock_path, commands, self.player)
+
+    def _mark(self, item: PlayItem) -> None:
+        if self.book is not None:
+            self.book.mark(item.rule_name, self.now())
+
+    def _handle_first(self, first: PlayItem) -> None:
+        config = self.config_getter()
+        if self._cooling(first, config):
+            return
+        self._play_locked(first.commands)
+        self._mark(first)
+        config = self.config_getter()
+        threshold = int(config.get("burst_threshold", 3))
+        window = float(config.get("burst_window_seconds", 5))
+        with self._cv:
+            limit = first.enqueued_at + window
+            waiting = []
+            rest: deque = deque()
+            for item in self._items:
+                if item.enqueued_at <= limit:
+                    waiting.append(item)
+                else:
+                    rest.append(item)
+            overflow = self._overflow
+            total = 1 + len(waiting) + overflow
+            if total > threshold and (waiting or overflow):
+                self._items = rest
+                self._overflow = 0
+                collapsed = waiting
+                extra = overflow
+                normal: list = []
+            else:
+                self._items = rest
+                normal = waiting
+                collapsed = []
+                extra = 0
+        if collapsed or extra:
+            self._play_locked(collapse_commands(config, collapsed, len(collapsed) + extra))
+            return
+        for item in normal:
+            fresh = self.config_getter()
+            if self._cooling(item, fresh):
+                continue
+            self._play_locked(item.commands)
+            self._mark(item)
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while not self._items and not self._stop:
+                    self._cv.wait()
+                if not self._items and self._stop:
+                    return
+                first = self._items.popleft()
+                self._busy = True
+            try:
+                self._handle_first(first)
+            except Exception as exc:
+                LOG.error("Playback failed (%s).", exc)
+            finally:
+                with self._cv:
+                    self._busy = False
+                    self._cv.notify_all()
+
+
+def clock_now() -> datetime:
+    return datetime.now()
+
+
+def bot_is_notify_only(title: str, subtitle: str, names: list) -> bool:
+    fields = [title.casefold(), subtitle.casefold()]
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        needle = name.strip().casefold()
+        if needle and any(needle in field for field in fields):
+            return True
+    return False
+
+
+NOTIFY_QUEUE_NAME = "notify-queue.json"
+NOTIFY_PID_NAME = "notify-drainer.pid"
+NOTIFY_SPAWN_LOCK = "notify-spawn.lock"
+NOTIFY_QUEUE_LOCK = "notify-queue.lock"
+
+
+def _exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def notify_pid_path(state_path: Path) -> Path:
+    return Path(state_path).parent / NOTIFY_PID_NAME
+
+
+def read_drainer_pid(state_path: Path) -> int | None:
+    try:
+        return int(notify_pid_path(state_path).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def drainer_alive(state_path: Path) -> bool:
+    pid = read_drainer_pid(state_path)
+    return pid is not None and _pid_alive(pid)
+
+
+def write_drainer_pid(state_path: Path, pid: int) -> None:
+    path = notify_pid_path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{int(pid)}\n", encoding="utf-8")
+
+
+def clear_drainer_pid(state_path: Path, pid: int) -> None:
+    if read_drainer_pid(state_path) != pid:
+        return
+    try:
+        notify_pid_path(state_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _queue_file(state_path: Path) -> Path:
+    return Path(state_path).parent / NOTIFY_QUEUE_NAME
+
+
+def append_notify_item(state_path: Path, item: dict) -> None:
+    path = _queue_file(state_path)
+    fd = _exclusive_lock(Path(state_path).parent / NOTIFY_QUEUE_LOCK)
+    try:
+        items: list = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    items = loaded
+            except (OSError, json.JSONDecodeError):
+                items = []
+        items.append(item)
+        _write_state_document(path, items)
+    finally:
+        _release_lock(fd)
+
+
+def take_notify_items(state_path: Path) -> list:
+    path = _queue_file(state_path)
+    fd = _exclusive_lock(Path(state_path).parent / NOTIFY_QUEUE_LOCK)
+    try:
+        items: list = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    items = loaded
+            except (OSError, json.JSONDecodeError):
+                items = []
+        if path.exists() or items:
+            _write_state_document(path, [])
+        return items
+    finally:
+        _release_lock(fd)
+
+
+def _play_item_from_raw(raw: dict) -> PlayItem | None:
+    commands = raw.get("commands")
+    if not isinstance(commands, list):
+        return None
+    try:
+        enqueued_at = float(raw.get("enqueued_at"))
+    except (TypeError, ValueError):
+        enqueued_at = time.time()
+    return PlayItem(commands, str(raw.get("rule_name") or "default"), enqueued_at, bool(raw.get("say")))
+
+
+def spawn_drainer(config_path: Path, state_path: Path) -> int:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--drain-notify",
+        "--config",
+        str(config_path),
+        "--state",
+        str(state_path),
+    ]
+    proc = subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return int(proc.pid)
+
+
+def ensure_drainer(config_path: Path, state_path: Path) -> None:
+    state_path = Path(state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _exclusive_lock(state_path.parent / NOTIFY_SPAWN_LOCK)
+    try:
+        if drainer_alive(state_path):
+            return
+        pid = spawn_drainer(Path(config_path), state_path)
+        write_drainer_pid(state_path, pid)
+    finally:
+        _release_lock(fd)
+
+
+def enqueue_notification(
+    config: dict,
+    config_path: Path,
+    state_path: Path,
+    *,
+    bot: str,
+    title: str,
+    body: str,
+    now: datetime,
+) -> str:
+    outcome = plan_notification(
+        title,
+        "",
+        body,
+        config,
+        now=now,
+        cooldowns=load_cooldowns(state_path),
+        mark=False,
+        sender=bot,
+    )
+    sound = outcome.effective_sound or outcome.match.sound
+    LOG.info(
+        "notify bot=%s rule=%s sound=%s result=%s",
+        bot,
+        outcome.match.rule_name,
+        sound,
+        outcome.result,
+    )
+    if not outcome.commands:
+        return outcome.result
+    say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
+    append_notify_item(
+        state_path,
+        {
+            "id": f"{time.time()}-{os.getpid()}",
+            "rule_name": outcome.match.rule_name,
+            "sound": sound,
+            "commands": outcome.commands,
+            "say": bool(say),
+            "enqueued_at": time.time(),
+        },
+    )
+    ensure_drainer(config_path, state_path)
+    return outcome.result
+
+
+def drain_notify_queue(config_path: Path, state_path: Path, player=None, clock=None) -> None:
+    state_path = Path(state_path)
+    config_path = Path(config_path)
+    player = play_commands if player is None else player
+    clock = time.time if clock is None else clock
+    pid = os.getpid()
+    write_drainer_pid(state_path, pid)
+    book = CooldownBook(state_path)
+    holder = {"config": builtin_defaults()}
+    try:
+        holder["config"] = load_runtime_config(config_path)
+    except ConfigError:
+        pass
+
+    def config_getter():
+        try:
+            holder["config"] = load_runtime_config(config_path)
+        except ConfigError:
+            pass
+        return holder["config"]
+
+    queue = PlaybackQueue(
+        config_getter=config_getter,
+        player=player,
+        lock_path=lock_path_for(state_path),
+        book=book,
+        clock=clock,
+    )
+    queue.start()
+    try:
+        idle_rounds = 0
+        while idle_rounds < 8:
+            for raw in take_notify_items(state_path):
+                item = _play_item_from_raw(raw)
+                if item is not None:
+                    queue.enqueue(item)
+            if queue.idle():
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
+            time.sleep(0.02)
+        try:
+            queue.drain(timeout=5)
+        except TimeoutError:
+            pass
+    finally:
+        queue.close()
+        clear_drainer_pid(state_path, pid)
+
+
+def _xml_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def write_agent_plist(home: Path, python: str, script: str) -> Path:
+    agents = Path(home) / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    dest = agents / f"{AGENT_LABEL}.plist"
+    body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{AGENT_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{_xml_escape(python)}</string>
+		<string>{_xml_escape(script)}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>
+"""
+    dest.write_text(body, encoding="utf-8")
+    return dest
+
+
+def sync_agent_mode(mode: str, home: Path | None = None, *, finder=None, run=None) -> str | None:
+    """Load or unload the agent. None means launchctl ran. A string means it did not."""
+    home = Path.home() if home is None else Path(home)
+    finder = shutil.which if finder is None else finder
+    if not finder("launchctl"):
+        return "agent was not changed"
+    runner = subprocess.run if run is None else run
+
+    def invoke(args: list[str]) -> None:
+        command = ["launchctl", *args]
+        try:
+            runner(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except TypeError:
+            try:
+                runner(command)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    label = f"gui/{os.getuid()}/{AGENT_LABEL}"
+    if mode == "notify":
+        invoke(["bootout", label])
+        return None
+    script = home / "Library" / "Application Support" / "GrokBotNotifySounds" / "grokbot_notify_sounds.py"
+    if not script.is_file():
+        script = Path(__file__).resolve()
+    plist = write_agent_plist(home, sys.executable, str(script))
+    invoke(["bootout", label])
+    invoke(["bootstrap", f"gui/{os.getuid()}", str(plist)])
+    invoke(["enable", label])
+    return None
+
+
+def set_rule_enabled(raw: dict, name: str, enabled: bool) -> None:
+    _index, rule = _find_rule(raw, name)
+    rule["enabled"] = enabled
+
+
+def _checked_master(text: str) -> int:
+    if not re.fullmatch(r"\d+", text):
+        raise ConfigError(["master_volume must be an integer from 0 to 100"])
+    value = int(text)
+    if value > 100:
+        raise ConfigError(["master_volume must be an integer from 0 to 100"])
+    return value
+
+
+def _set_success(pairs: list[str]) -> str:
+    parts = []
+    for pair in pairs:
+        key, _sep, value = pair.partition("=")
+        parts.append(f"{key}={value}")
+    return "set " + " ".join(parts)
 
 
 def _volume_argument(text: str) -> int:
@@ -1437,16 +2400,29 @@ def _position_argument(text: str) -> int:
 
 
 def run_loop(config_source: ConfigSource, db_path: Path, state_path: Path, once: bool, clock) -> None:
-    cooldowns: dict[str, datetime] = {}
-    while True:
-        config = config_source.current()
-        try:
-            poll_once(db_path, config, state_path, cooldowns, clock)
-        except Exception as exc:
-            LOG.error("Poll failed (%s). Will retry.", type(exc).__name__)
-        if once:
-            return
-        time.sleep(config["poll_interval_seconds"])
+    holder = {"config": builtin_defaults()}
+    book = CooldownBook(state_path)
+    queue = PlaybackQueue(
+        config_getter=lambda: holder["config"],
+        player=play_commands,
+        lock_path=lock_path_for(state_path),
+        book=book,
+    )
+    queue.start()
+    try:
+        while True:
+            config = config_source.current()
+            holder["config"] = config
+            try:
+                poll_once(db_path, config, state_path, book.snapshot(), clock, queue=queue)
+            except Exception as exc:
+                LOG.error("Poll failed (%s). Will retry.", type(exc).__name__)
+            if once:
+                queue.drain()
+                return
+            time.sleep(config["poll_interval_seconds"])
+    finally:
+        queue.close()
 
 
 def _selected_actions(args: argparse.Namespace) -> list[str]:
@@ -1457,6 +2433,8 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("list-apps")
     if args.list_rules:
         names.append("list-rules")
+    if args.list_voices:
+        names.append("list-voices")
     if args.validate:
         names.append("validate")
     if args.test is not None:
@@ -1465,6 +2443,8 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("test-rule")
     if args.play:
         names.append("play")
+    if args.notify:
+        names.append("notify")
     if args.status:
         names.append("status")
     if args.pause:
@@ -1477,6 +2457,10 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("enable")
     if args.disable:
         names.append("disable")
+    if args.enable_rule:
+        names.append("enable-rule")
+    if args.disable_rule:
+        names.append("disable-rule")
     if args.add_rule is not None:
         names.append("add-rule")
     if args.remove_rule:
@@ -1487,6 +2471,8 @@ def _selected_actions(args: argparse.Namespace) -> list[str]:
         names.append("move-rule")
     if args.set:
         names.append("set")
+    if args.set_mode:
+        names.append("set-mode")
     if args.uninstall:
         names.append("uninstall")
     if args.once:
@@ -1504,8 +2490,9 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     parser.add_argument("--db", type=Path, help="Notification Center database path")
     parser.add_argument("--once", action="store_true", help="Poll once and exit")
     parser.add_argument("--list-apps", action="store_true", help="Print bundle ids from the database")
-    parser.add_argument("--list-sounds", action="store_true", help="Print built-in sound names")
-    parser.add_argument("--list-rules", action="store_true", help="Print rule name and sound")
+    parser.add_argument("--list-sounds", action="store_true", help="Print built-in sounds and custom paths")
+    parser.add_argument("--list-voices", action="store_true", help="Print installed voices and the auto-picked one")
+    parser.add_argument("--list-rules", action="store_true", help="Print rules in list order")
     parser.add_argument("--validate", action="store_true", help="Check the config and exit")
     parser.add_argument("--test", metavar="TEXT", help="Treat TEXT as the notification body and play")
     parser.add_argument("--test-rule", metavar="NAME", help="Play one rule's sound at its effective volume")
@@ -1513,20 +2500,27 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     parser.add_argument("--volume", type=_volume_argument, default=None, help="Preview volume 0-100 for --play (default 100)")
     parser.add_argument("--title", default="", help="Title used with --test")
     parser.add_argument("--subtitle", default="", help="Subtitle used with --test")
-    parser.add_argument("--bot", default=None, help="Sender name used to match a rule bot, for --test")
+    parser.add_argument("--bot", default=None, help="Sender name used to match a rule bot, for --test or --notify")
+    parser.add_argument("--body", default="", help="Body used with --notify")
+    parser.add_argument("--notify", action="store_true", help="Queue a notification from a bot and return")
+    parser.add_argument("--drain-notify", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--respect-cooldown", action="store_true", help="With --test, honor the shared cooldown")
     parser.add_argument("--status", action="store_true", help="Print a parseable status report")
     parser.add_argument("--pause", action="store_true", help="Set paused true and write the config")
     parser.add_argument("--resume", action="store_true", help="Set paused false and write the config")
     parser.add_argument("--enable", action="store_true", help="Set enabled true and write the config")
     parser.add_argument("--disable", action="store_true", help="Set enabled false and write the config")
-    parser.add_argument("--set-master-volume", type=_volume_argument, metavar="N", help="Set master_volume to N (0-100)")
+    parser.add_argument("--enable-rule", metavar="NAME", help="Set one rule's enabled flag true")
+    parser.add_argument("--disable-rule", metavar="NAME", help="Set one rule's enabled flag false")
+    parser.add_argument("--set-master-volume", metavar="N", help="Set master_volume to N (0-100)")
     parser.add_argument("--add-rule", metavar="JSON", help="Append one rule object. '-' reads stdin")
     parser.add_argument("--remove-rule", metavar="NAME", help="Remove the rule with this name")
     parser.add_argument("--update-rule", nargs=2, metavar=("NAME", "JSON"), help="Merge a partial rule object. '-' reads stdin")
     parser.add_argument("--move-rule", metavar="NAME", help="Move a rule to --to N (1-based)")
     parser.add_argument("--to", type=_position_argument, default=None, help="1-based position for --move-rule")
     parser.add_argument("--set", action="append", default=None, metavar="KEY=VALUE", help="Set a dotted config key. Repeatable")
-    parser.add_argument("--uninstall", action="store_true", help="Remove the LaunchAgent and the installed script")
+    parser.add_argument("--set-mode", metavar="MODE", help="Set mode to watch or notify and load or unload the agent")
+    parser.add_argument("--uninstall", action="store_true", help="Remove the LaunchAgent, the shim, and the installed script")
     args = parser.parse_args(argv)
     setup_logging(log_path)
 
@@ -1543,14 +2537,41 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     if "move-rule" in actions and args.to is None:
         print("--move-rule requires --to N.", file=sys.stderr)
         return 2
+    if args.respect_cooldown and "test" not in actions:
+        print("--respect-cooldown is only used with --test.", file=sys.stderr)
+        return 2
+    if args.notify and not args.bot:
+        print("--notify requires --bot NAME.", file=sys.stderr)
+        return 2
+
+    config_path = Path(args.config) if args.config is not None else default_config_path()
+    state_path = Path(args.state) if args.state is not None else default_state_path()
+
+    if args.drain_notify:
+        if actions:
+            print("Pass one command.", file=sys.stderr)
+            return 2
+        drain_notify_queue(config_path, state_path)
+        return 0
 
     if "list-sounds" in actions:
-        if not SYSTEM_SOUNDS_DIR.is_dir():
-            print(f"No system sounds directory at {SYSTEM_SOUNDS_DIR}", file=sys.stderr)
-            return 0
-        names = sorted(path.stem for path in SYSTEM_SOUNDS_DIR.glob("*.aiff") if path.is_file())
-        for name in names:
-            print(name)
+        try:
+            listed = load_runtime_config(config_path)
+        except ConfigError as exc:
+            print("; ".join(exc.errors), file=sys.stderr)
+            return 2
+        for line in BUILTIN_SOUND_LINES:
+            print(line)
+        for line in custom_sound_lines(listed):
+            print(line)
+        return 0
+
+    if "list-voices" in actions:
+        voices = load_voices()
+        if voices is None:
+            print("Could not list voices because say -v '?' failed.", file=sys.stderr)
+            return 2
+        sys.stdout.write(format_voice_report(voices))
         return 0
 
     if "list-apps" in actions:
@@ -1574,14 +2595,29 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     if "uninstall" in actions:
         return uninstall_agent()
 
-    config_path = Path(args.config) if args.config is not None else default_config_path()
-    state_path = Path(args.state) if args.state is not None else default_state_path()
+    if "notify" in actions:
+        try:
+            config = load_runtime_config(config_path)
+        except ConfigError as exc:
+            print("; ".join(exc.errors), file=sys.stderr)
+            return 2
+        enqueue_notification(
+            config,
+            config_path,
+            state_path,
+            bot=args.bot,
+            title=args.title,
+            body=args.body or "",
+            now=clock_now(),
+        )
+        return 0
+
     db_path = resolve_db_path(args.db)
 
     if "list-rules" in actions or "validate" in actions:
         text = _load_text_or_exit(config_path)
         if text is None:
-            return 1
+            return 2
         if "validate" in actions:
             errors, note = validation_report(text)
             return _print_errors(errors, note)
@@ -1613,50 +2649,102 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
         return 0
 
     if "pause" in actions:
-        return edit_config(config_path, lambda raw: raw.__setitem__("paused", True))
+        return edit_config(config_path, lambda raw: raw.__setitem__("paused", True), "paused")
     if "resume" in actions:
-        return edit_config(config_path, lambda raw: raw.__setitem__("paused", False))
+        return edit_config(config_path, lambda raw: raw.__setitem__("paused", False), "resumed")
     if "enable" in actions:
-        return edit_config(config_path, lambda raw: raw.__setitem__("enabled", True))
+        return edit_config(config_path, lambda raw: raw.__setitem__("enabled", True), "enabled")
     if "disable" in actions:
-        return edit_config(config_path, lambda raw: raw.__setitem__("enabled", False))
+        return edit_config(config_path, lambda raw: raw.__setitem__("enabled", False), "disabled")
+    if "enable-rule" in actions:
+        rule_name = args.enable_rule
+        return edit_config(
+            config_path,
+            lambda raw: set_rule_enabled(raw, rule_name, True),
+            f'enabled rule "{rule_name}"',
+        )
+    if "disable-rule" in actions:
+        rule_name = args.disable_rule
+        return edit_config(
+            config_path,
+            lambda raw: set_rule_enabled(raw, rule_name, False),
+            f'disabled rule "{rule_name}"',
+        )
     if "set-master-volume" in actions:
-        volume = args.set_master_volume
-        return edit_config(config_path, lambda raw: raw.__setitem__("master_volume", volume))
+        try:
+            volume = _checked_master(args.set_master_volume)
+        except ConfigError as exc:
+            print(exc.errors[0], file=sys.stderr)
+            return 2
+        return edit_config(
+            config_path,
+            lambda raw: raw.__setitem__("master_volume", volume),
+            f"master volume set to {volume}",
+        )
     if "add-rule" in actions:
         try:
             rule = parse_json_value(args.add_rule)
         except ConfigError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        return edit_config(config_path, lambda raw: add_rule(raw, rule))
+            print("; ".join(exc.errors), file=sys.stderr)
+            return 2
+        added = rule.get("name").strip() if isinstance(rule, dict) and isinstance(rule.get("name"), str) else ""
+        return edit_config(config_path, lambda raw: add_rule(raw, rule), f'added rule "{added}"')
     if "remove-rule" in actions:
-        return edit_config(config_path, lambda raw: remove_rule(raw, args.remove_rule))
+        removed = args.remove_rule
+        return edit_config(config_path, lambda raw: remove_rule(raw, removed), f'removed rule "{removed}"')
     if "update-rule" in actions:
         name, payload = args.update_rule
         try:
             patch = parse_json_value(payload)
         except ConfigError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        return edit_config(config_path, lambda raw: update_rule(raw, name, patch))
+            print("; ".join(exc.errors), file=sys.stderr)
+            return 2
+        updated = name
+        if isinstance(patch, dict) and isinstance(patch.get("name"), str) and patch["name"].strip():
+            updated = patch["name"].strip()
+        return edit_config(config_path, lambda raw: update_rule(raw, name, patch), f'updated rule "{updated}"')
     if "move-rule" in actions:
-        return edit_config(config_path, lambda raw: move_rule(raw, args.move_rule, args.to))
+        moved = args.move_rule
+        position = args.to
+        return edit_config(
+            config_path,
+            lambda raw: move_rule(raw, moved, position),
+            f'moved rule "{moved}" to {position}',
+        )
     if "set" in actions:
         pairs = list(args.set)
-        return edit_config(config_path, lambda raw: apply_settings(raw, pairs))
+        return edit_config(config_path, lambda raw: apply_settings(raw, pairs), _set_success(pairs))
+    if "set-mode" in actions:
+        mode = str(args.set_mode)
+        if mode not in ("watch", "notify"):
+            print("mode must be watch or notify", file=sys.stderr)
+            return 2
+        code = edit_config(config_path, lambda raw: raw.__setitem__("mode", mode))
+        if code != 0:
+            return code
+        note = sync_agent_mode(mode)
+        if note:
+            print(f"mode set to {mode}; {note}")
+        else:
+            print(f"mode set to {mode}")
+        return 0
 
     if "test-rule" in actions or "play" in actions or "test" in actions:
         try:
             config = load_runtime_config(config_path)
         except ConfigError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+            print("; ".join(exc.errors), file=sys.stderr)
+            return 2
+        lock_path = lock_path_for(state_path)
         if "test-rule" in actions:
             match = next((rule for rule in config["rules"] if rule["name"] == args.test_rule), None)
             if match is None:
                 print(f"No rule named {args.test_rule!r}", file=sys.stderr)
-                return 1
+                return 2
+            problem = sound_problem(match["sound"], active_sounds_dir())
+            if problem and Path(active_sounds_dir()).is_dir():
+                print(problem, file=sys.stderr)
+                return 2
             sys.stdout.write(render_rule_preview(match, config))
             volume = _resolved_volume(match["volume"], config)
             commands = build_commands(
@@ -1669,14 +2757,19 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
                 "",
                 "",
             )
-            return play_reported(commands)
+            return play_reported(commands, lock_path)
         if "play" in actions:
             volume = 100 if args.volume is None else args.volume
             try:
                 classify_sound(args.play)
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
-                return 1
+                return 2
+            problem = sound_problem(args.play, active_sounds_dir())
+            if problem:
+                print(problem, file=sys.stderr)
+                LOG.info("play sound=%s result=error %s", args.play, problem)
+                return 2
             afplay = afplay_volume_str(volume, int(config["master_volume"]))
             sys.stdout.write(
                 "\n".join(
@@ -1688,21 +2781,51 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
                 )
                 + "\n"
             )
-            return play_reported(
-                build_commands(args.play, volume, int(config["master_volume"]), False, None, "", "", "")
-            )
-        outcome = plan_notification(
-            args.title,
-            args.subtitle,
-            args.test,
-            config,
-            now=datetime.now(),
-            cooldowns={},
-            mark=False,
-            sender=args.bot,
+            commands = build_commands(args.play, volume, int(config["master_volume"]), False, None, "", "", "")
+            code = play_reported(commands, lock_path)
+            if code == 0:
+                LOG.info("play sound=%s result=played", args.play)
+            else:
+                LOG.info("play sound=%s result=error exit %s", args.play, code)
+            return code
+        match = classify(args.title, args.subtitle, args.test, config, args.bot)
+        problem = sound_problem(match.sound, active_sounds_dir())
+        if problem:
+            print(problem, file=sys.stderr)
+            LOG.info("test rule=%s sound=%s result=error %s", match.rule_name, match.sound, problem)
+            return 2
+        if args.respect_cooldown:
+            window = float(config["cooldown_seconds"])
+            previous = load_cooldowns(state_path).get(match.rule_name)
+            if window > 0 and previous is not None and (datetime.now() - previous).total_seconds() < window:
+                print("suppressed by cooldown")
+                LOG.info("test rule=%s result=suppressed", match.rule_name)
+                return 0
+        outcome = Outcome(
+            match,
+            "play",
+            build_commands(
+                match.sound,
+                match.volume,
+                int(config["master_volume"]),
+                match.say,
+                match.voice,
+                args.title,
+                args.subtitle,
+                args.test,
+                say_text=match.say_text,
+                bot=match.bot or args.bot,
+            ),
+            int(config["master_volume"]),
         )
         sys.stdout.write(render_test(outcome))
-        return play_reported(outcome.commands)
+        code = play_reported(outcome.commands, lock_path)
+        if code == 0:
+            save_cooldown(state_path, match.rule_name, datetime.now())
+            LOG.info("test rule=%s sound=%s result=played", match.rule_name, match.sound)
+        else:
+            LOG.info("test rule=%s sound=%s result=error exit %s", match.rule_name, match.sound, code)
+        return code
 
     source = ConfigSource(config_path)
     run_loop(source, db_path, state_path, "once" in actions, datetime.now)
