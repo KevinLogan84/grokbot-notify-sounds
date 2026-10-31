@@ -109,9 +109,9 @@ load_agent() {
   local plist="$2"
   local label="gui/${uid}/com.grokbot.notify-sounds"
   local domain="gui/${uid}"
-  if command launchctl bootout "${label}" 2>/dev/null; then
+  if launchctl bootout "${label}" 2>/dev/null; then
     local start=${SECONDS}
-    while command launchctl print "${label}" >/dev/null 2>&1; do
+    while launchctl print "${label}" >/dev/null 2>&1; do
       if (( SECONDS - start >= 5 )); then
         break
       fi
@@ -122,9 +122,9 @@ load_agent() {
   local err_file
   err_file="$(mktemp)"
   while (( attempt <= 3 )); do
-    if command launchctl bootstrap "${domain}" "${plist}" >"${err_file}" 2>&1; then
+    if launchctl bootstrap "${domain}" "${plist}" >"${err_file}" 2>&1; then
       rm -f "${err_file}"
-      command launchctl enable "${label}"
+      launchctl enable "${label}"
       return 0
     fi
     if (( attempt < 3 )); then

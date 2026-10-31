@@ -10,22 +10,6 @@ from __future__ import annotations
 import os
 import sys
 
-_DRY_ENV_KEYS = ("GROKBOT_SOUNDS_DRY_RUN", "GROKBOT_SOUNDS_PLAYER")
-
-
-def _sounds_blocked_by_env() -> bool:
-    """Either flag means: do not exec afplay, say, or launchctl."""
-    return os.environ.get("GROKBOT_SOUNDS_DRY_RUN") == "1" or os.environ.get("GROKBOT_SOUNDS_PLAYER") == "fake"
-
-
-def _forward_sound_env(base: dict | None = None) -> dict:
-    """Copy the dry-run flags into a child environment."""
-    env = os.environ.copy() if base is None else dict(base)
-    for key in _DRY_ENV_KEYS:
-        if key in os.environ:
-            env[key] = os.environ[key]
-    return env
-
 
 def _should_fast_notify(argv: list[str]) -> bool:
     """Parent --notify returns before the heavy imports and before say -v '?'."""
@@ -65,7 +49,6 @@ def _fast_notify_main(argv: list[str]) -> int:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=_forward_sound_env(),
     )
     _record_child_pid(proc.pid)
     return 0
@@ -96,7 +79,6 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -1317,36 +1299,8 @@ def player_tool(name: str) -> str:
     return name
 
 
-DRY_RUN_PLAYS: list[dict] = []
-
-
-def _describe_playback(commands: list[list[str]]) -> tuple[str, str, str]:
-    sound = ""
-    volume = ""
-    spoken = "none"
-    for command in commands:
-        if not command:
-            continue
-        if command[0] == "afplay" and len(command) >= 4:
-            volume = str(command[2])
-            name = Path(str(command[3])).name
-            sound = name[:-5] if name.endswith(".aiff") else str(command[3])
-        elif command[0] == "say" and command[-1]:
-            spoken = str(command[-1])
-    return sound, volume, spoken
-
-
-def _record_dry_run(commands: list[list[str]]) -> None:
-    sound, volume, spoken = _describe_playback(commands)
-    DRY_RUN_PLAYS.append({"sound": sound, "volume": volume, "say": spoken})
-    LOG.info("dry-run sound=%s volume=%s say=%s", sound, volume, spoken)
-
-
 def play_commands(commands: list[list[str]]) -> None:
     """Run afplay and say, one after another. Tests replace this function."""
-    if _sounds_blocked_by_env():
-        _record_dry_run(commands)
-        return
     for command in commands:
         command = [player_tool(command[0]), *command[1:]] if command else command
         result = subprocess.run(command, check=False)
@@ -1761,8 +1715,6 @@ def probe_agent(which=None, run=None) -> str:
     finder = shutil.which if which is None else which
     if not finder("launchctl"):
         return "unknown"
-    if run is None and _sounds_blocked_by_env():
-        return "unknown"
     runner = subprocess.run if run is None else run
     try:
         result = runner(
@@ -1849,7 +1801,7 @@ def render_rule_preview(rule: dict, config: dict) -> str:
 def uninstall_agent(home: Path | None = None, *, exists=None, run=None) -> int:
     home = Path.home() if home is None else Path(home)
     finder = shutil.which if exists is None else exists
-    if finder("launchctl") and not (run is None and _sounds_blocked_by_env()):
+    if finder("launchctl"):
         command = ["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"]
         try:
             if run is None:
@@ -1928,8 +1880,6 @@ def clear_voice_cache() -> None:
 def read_voice_listing() -> str | None:
     if _VOICE_OVERRIDE_SET:
         return _VOICE_LISTING_OVERRIDE
-    if _sounds_blocked_by_env():
-        return None
     try:
         result = subprocess.run([player_tool("say"), "-v", "?"], capture_output=True, text=True, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -2659,7 +2609,6 @@ def spawn_drainer(config_path: Path, state_path: Path) -> int:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=_forward_sound_env(),
     )
     _record_child_pid(proc.pid)
     return int(proc.pid)
@@ -2740,55 +2689,37 @@ def enqueue_notification(
     return outcome.result
 
 
-def _path_under_temp(path: Path) -> bool:
-    try:
-        resolved = Path(path).resolve()
-        root = Path(tempfile.gettempdir()).resolve()
-    except OSError:
-        return False
-    return resolved == root or root in resolved.parents
-
-
-def _temp_playback_refused(config_path: Path) -> bool:
-    """A worker that outlived the suite and lost the dry-run flag must not play."""
-    return not _sounds_blocked_by_env() and _path_under_temp(config_path)
-
-
 def drain_notify_queue(config_path: Path, state_path: Path, player=None, clock=None) -> None:
     state_path = Path(state_path)
     config_path = Path(config_path)
+    player = play_commands if player is None else player
+    clock = time.time if clock is None else clock
     pid = os.getpid()
     write_drainer_pid(state_path, pid)
-    queue = None
+    book = CooldownBook(state_path)
+    holder = {"config": builtin_defaults()}
     try:
-        if _temp_playback_refused(config_path):
-            LOG.error("refusing to play: config is under the temp dir and dry-run is not set")
-            return
-        player = play_commands if player is None else player
-        clock = time.time if clock is None else clock
-        book = CooldownBook(state_path)
-        holder = {"config": builtin_defaults()}
+        holder["config"] = load_runtime_config(config_path)
+    except ConfigError:
+        pass
+
+    def config_getter():
         try:
             holder["config"] = load_runtime_config(config_path)
         except ConfigError:
             pass
+        return holder["config"]
 
-        def config_getter():
-            try:
-                holder["config"] = load_runtime_config(config_path)
-            except ConfigError:
-                pass
-            return holder["config"]
-
-        queue = PlaybackQueue(
-            config_getter=config_getter,
-            player=player,
-            lock_path=lock_path_for(state_path),
-            book=book,
-            clock=clock,
-            hold_for_burst=True,
-        )
-        queue.start()
+    queue = PlaybackQueue(
+        config_getter=config_getter,
+        player=player,
+        lock_path=lock_path_for(state_path),
+        book=book,
+        clock=clock,
+        hold_for_burst=True,
+    )
+    queue.start()
+    try:
         idle_rounds = 0
         while idle_rounds < 8:
             for raw in take_notify_items(state_path):
@@ -2805,8 +2736,7 @@ def drain_notify_queue(config_path: Path, state_path: Path, player=None, clock=N
         except TimeoutError:
             pass
     finally:
-        if queue is not None:
-            queue.close()
+        queue.close()
         clear_drainer_pid(state_path, pid)
 
 
@@ -2841,10 +2771,6 @@ def write_agent_plist(home: Path, python: str, script: str) -> Path:
 
 
 def _run_launchctl(runner, args: list[str]) -> tuple[int, str]:
-    if runner is subprocess.run and _sounds_blocked_by_env():
-        if args and args[0] == "bootstrap":
-            return 0, ""
-        return 1, "dry-run"
     command = ["launchctl", *args]
     try:
         result = runner(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -2876,7 +2802,7 @@ def sync_agent_mode(mode: str, home: Path | None = None, *, finder=None, run=Non
     """
     home = Path.home() if home is None else Path(home)
     finder = shutil.which if finder is None else finder
-    if not finder("launchctl") or (run is None and _sounds_blocked_by_env()):
+    if not finder("launchctl"):
         return "agent was not changed"
     runner = subprocess.run if run is None else run
     label = f"gui/{os.getuid()}/{AGENT_LABEL}"
