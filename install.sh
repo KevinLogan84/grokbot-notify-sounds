@@ -101,9 +101,49 @@ PLIST="${PLIST//__SCRIPT__/${SCRIPT_ESC}}"
 printf '%s\n' "${PLIST}" > "${PLIST_DEST}"
 
 UID_NUM="$(id -u)"
-launchctl bootout "gui/${UID_NUM}/com.grokbot.notify-sounds" 2>/dev/null || true
-launchctl bootstrap "gui/${UID_NUM}" "${PLIST_DEST}"
-launchctl enable "gui/${UID_NUM}/com.grokbot.notify-sounds"
+
+# bootout can return before launchd drops the job. Wait until print
+# says it is gone, then bootstrap, and retry a transient I/O error.
+load_agent() {
+  local uid="$1"
+  local plist="$2"
+  local label="gui/${uid}/com.grokbot.notify-sounds"
+  local domain="gui/${uid}"
+  if launchctl bootout "${label}" 2>/dev/null; then
+    local start=${SECONDS}
+    while launchctl print "${label}" >/dev/null 2>&1; do
+      if (( SECONDS - start >= 5 )); then
+        break
+      fi
+      sleep 0.2
+    done
+  fi
+  local attempt=1
+  local err_file
+  err_file="$(mktemp)"
+  while (( attempt <= 3 )); do
+    if launchctl bootstrap "${domain}" "${plist}" >"${err_file}" 2>&1; then
+      rm -f "${err_file}"
+      launchctl enable "${label}"
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      sleep 1
+    fi
+    attempt=$((attempt + 1))
+  done
+  local err
+  err="$(cat "${err_file}")"
+  err="${err%$'\n'}"
+  rm -f "${err_file}"
+  if [[ -z "${err}" ]]; then
+    err="launchctl bootstrap failed"
+  fi
+  echo "The agent could not be loaded: ${err}" >&2
+  return 1
+}
+
+load_agent "${UID_NUM}" "${PLIST_DEST}"
 
 echo "LaunchAgent Python: ${PY}"
 echo "Grant Full Disk Access to that Python binary. See README.md."

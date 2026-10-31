@@ -593,6 +593,21 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("skip-mute", self.log.read_text(encoding="utf-8"))
 
     def test_notify_returns_before_a_slow_player_and_collapses(self):
+        self.config.write_text(
+            json.dumps(
+                {
+                    "burst_threshold": 3,
+                    "burst_window_seconds": 1.5,
+                    "queue_max": 20,
+                    "default": {"sound": "Tink", "volume": 40, "say": False},
+                    "rules": [
+                        {"name": name, "bot": name, "sound": "Glass", "volume": 80}
+                        for name in ("One", "Two", "Three", "Four")
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         started = threading.Event()
 
         def slow(commands):
@@ -603,13 +618,13 @@ class NotifyTests(unittest.TestCase):
 
         gns.play_commands = slow
         began = time.monotonic()
-        code, _out, err = self._main(["--notify", "--bot", "Alfred", "--title", "one"])
+        code, _out, err = self._main(["--notify", "--bot", "One", "--title", "one"])
         elapsed = time.monotonic() - began
         self.assertEqual(code, 0, err)
         self.assertLess(elapsed, 0.5)
         self.assertTrue(started.wait(2))
-        for index in range(3):
-            code, _out, err = self._main(["--notify", "--bot", "Alfred", "--title", f"more-{index}"])
+        for name in ("Two", "Three", "Four"):
+            code, _out, err = self._main(["--notify", "--bot", name, "--title", name])
             self.assertEqual(code, 0, err)
         time.sleep(0.25)
         self.release.set()
@@ -707,7 +722,15 @@ class InstallTests(unittest.TestCase):
             home.mkdir()
             stub.mkdir()
             launch = stub / "launchctl"
-            launch.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$HOME/launchctl.log"\nexit 0\n', encoding="utf-8")
+            launch.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$HOME/launchctl.log\"\n"
+                "case \"$1\" in\n"
+                "  print) exit 1 ;;\n"
+                "esac\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
             launch.chmod(launch.stat().st_mode | stat.S_IEXEC)
             env = os.environ.copy()
             env["HOME"] = str(home)
@@ -836,6 +859,15 @@ class VoiceMatchTests(unittest.TestCase):
         self.assertEqual(gns.resolve_voice("flo", gns.parse_voices(FIXTURE)).name, "Flo (English (US))")
         self.assertEqual(gns.resolve_voice("Samantha", gns.parse_voices(FIXTURE)).name, "Samantha")
         self.assertEqual(gns.resolve_voice("SAMANTHA", gns.parse_voices(FIXTURE)).name, "Samantha")
+        repeated = (
+            "Samantha            en_US    # Hello\n"
+            "Samantha            en_US    # Hello again\n"
+            "Samantha            en_GB    # Hi\n"
+        )
+        voices = gns.parse_voices(repeated)
+        self.assertEqual([(voice.name, voice.lang) for voice in voices], [("Samantha", "en_US"), ("Samantha", "en_GB")])
+        report = gns.format_voice_report(gns.parse_voices("Samantha            en_US    # Hello\nSamantha            en_US    # Again\n"))
+        self.assertEqual(sum(1 for line in report.splitlines() if "Samantha" in line and "en_US" in line), 1)
         self.assertEqual(
             gns.resolve_voice("Samantha (English (US))", gns.parse_voices(FIXTURE)).name,
             "Samantha (English (US))",
@@ -992,42 +1024,59 @@ class QuietTestTests(unittest.TestCase):
             code = gns.main(argv + ["--config", str(self.config), "--state", str(self.state)], log_path=self.log)
         return code, out.getvalue(), err.getvalue()
 
-    def test_mute_soft_and_as_live(self):
+    def test_test_honors_quiet_hours_and_cooldown(self):
         code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
         self.assertEqual(code, 0, err)
-        self.assertIn("sound: Glass", out)
-        self.assertEqual(len(self.played), 1)
-        self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
-
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--respect-quiet-hours"])
-        self.assertEqual(code, 0, err)
-        self.assertIn("quiet hours muted the sound", out)
-        self.assertEqual(len(self.played), 1)
+        self.assertIn("result=muted", out)
+        self.assertIn("result=muted", self.log.read_text(encoding="utf-8"))
+        self.assertEqual(self.played, [])
 
         data = json.loads(self.config.read_text(encoding="utf-8"))
         data["quiet_hours"]["mode"] = "soft"
         self.config.write_text(json.dumps(data), encoding="utf-8")
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--respect-quiet-hours"])
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
         self.assertEqual(code, 0, err)
-        self.assertIn("quiet hours softened the sound to the default sound", out)
-        self.assertTrue(self.played[-1][0][3].endswith("/Tink.aiff"))
+        self.assertIn("result=soft", out)
+        self.assertIn("sound: Tink", out)
+        self.assertIn("result=soft", self.log.read_text(encoding="utf-8"))
+        self.assertEqual(len(self.played), 1)
+        self.assertTrue(self.played[0][0][3].endswith("/Tink.aiff"))
 
-        data["paused"] = True
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--ignore-quiet-hours"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("sound: Glass", out)
+        self.assertNotIn("result=soft", out)
+        self.assertTrue(self.played[-1][0][3].endswith("/Glass.aiff"))
+
+        data["quiet_hours"]["enabled"] = False
+        data["cooldown_seconds"] = 60
+        self.config.write_text(json.dumps(data), encoding="utf-8")
+        if self.state.exists():
+            self.state.unlink()
+        self.played.clear()
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.played), 1)
+        self.assertTrue(self.played[0][0][3].endswith("/Glass.aiff"))
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("suppressed by cooldown", out)
+        self.assertEqual(len(self.played), 1)
+        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--ignore-cooldown"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.played), 2)
+        self.assertTrue(self.played[-1][0][3].endswith("/Glass.aiff"))
+
+        data["quiet_hours"]["enabled"] = True
         data["quiet_hours"]["mode"] = "mute"
         self.config.write_text(json.dumps(data), encoding="utf-8")
-        before = len(self.played)
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--as-live"])
+        code, out, err = self._main(
+            ["--test", "hello", "--bot", "Alfred", "--ignore-quiet-hours", "--ignore-cooldown"]
+        )
         self.assertEqual(code, 0, err)
-        self.assertIn("suppressed because paused", out)
-        self.assertEqual(len(self.played), before)
-
-        data["paused"] = False
-        data["enabled"] = False
-        self.config.write_text(json.dumps(data), encoding="utf-8")
-        code, out, err = self._main(["--test", "hello", "--bot", "Alfred", "--as-live"])
-        self.assertEqual(code, 0, err)
-        self.assertIn("suppressed because disabled", out)
-        self.assertEqual(len(self.played), before)
+        self.assertIn("sound: Glass", out)
+        self.assertEqual(len(self.played), 3)
+        self.assertTrue(self.played[-1][0][3].endswith("/Glass.aiff"))
 
 
 class NotifyParentTests(unittest.TestCase):
@@ -1248,6 +1297,7 @@ class BurstProcessTests(unittest.TestCase):
         self.assertEqual(names, ["Hero.aiff", "Glass.aiff", "Ping.aiff"])
         self.assertEqual(played[2][1], ["say", "-v", "Samantha", "and 3 more"])
         self.assertIn("burst collapsed (4)", messages)
+        self.assertIn("burst summary: sound=Ping volume=1 say=and 3 more", messages)
         self.assertEqual(sum(1 for message in messages if message.endswith("result=play")), 2)
         self.assertEqual(sum(1 for message in messages if message.endswith("result=collapsed")), 4)
 
@@ -1262,3 +1312,144 @@ class BurstProcessTests(unittest.TestCase):
         queue.close()
         self.assertEqual(played[2][1][-1], "hello there")
         self.assertNotIn("and 0 more", " ".join(played[2][1]))
+
+
+class DedupeProcessTests(unittest.TestCase):
+    def test_omitted_window_follows_the_burst_window(self):
+        omitted = gns.normalize_config(
+            {"default": {"sound": "Tink", "volume": 40}, "burst_window_seconds": 2}
+        )
+        self.assertNotIn("dedupe_window_seconds", omitted)
+        self.assertEqual(gns.dedupe_window_seconds(omitted), 2.0)
+        disabled = gns.normalize_config(
+            {
+                "default": {"sound": "Tink", "volume": 40},
+                "burst_window_seconds": 2,
+                "dedupe_window_seconds": 0,
+            }
+        )
+        self.assertEqual(gns.dedupe_window_seconds(disabled), 0.0)
+
+    def _layout(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        config = home / "config.json"
+        state = home / "state" / "state.json"
+        state.parent.mkdir()
+        config.write_text(
+            json.dumps(
+                {
+                    "burst_threshold": 3,
+                    "burst_window_seconds": 4,
+                    "cooldown_seconds": 0,
+                    "default": {"sound": "Tink", "volume": 40, "say": False},
+                    "rules": [
+                        {"name": "Ping", "contains": "hello", "sound": "Glass", "volume": 100, "say": False}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        bindir = home / "bin"
+        bindir.mkdir()
+        play_log = home / "played"
+        afplay = bindir / "afplay"
+        afplay.write_text('#!/bin/sh\nprintf \'%s\\n\' "$3" >> "$PLAY_LOG"\nexit 0\n', encoding="utf-8")
+        afplay.chmod(0o755)
+        say = bindir / "say"
+        say.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        say.chmod(0o755)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        env["PLAY_LOG"] = str(play_log)
+        log_path = home / "Library" / "Logs" / "grokbot-notify-sounds.log"
+        return config, state, env, play_log, log_path
+
+    def _notify(self, env, config, state, bot):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "grokbot_notify_sounds.py"),
+                "--notify",
+                "--bot",
+                bot,
+                "--body",
+                "hello",
+                "--config",
+                str(config),
+                "--state",
+                str(state),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _wait(self, path, predicate, timeout=8):
+        deadline = time.time() + timeout
+        text = ""
+        while time.time() < deadline:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            if predicate(text):
+                return text
+            time.sleep(0.05)
+        return text
+
+    def test_same_rule_and_bot_logs_dup(self):
+        config, state, env, play_log, log_path = self._layout()
+        self._notify(env, config, state, "Red")
+        text = self._wait(log_path, lambda raw: "result=play" in raw)
+        self.assertIn("result=play", text)
+        self._notify(env, config, state, "Red")
+        text = self._wait(log_path, lambda raw: "result=dup" in raw)
+        self.assertIn("result=dup", text)
+        self.assertEqual(text.count("result=play"), 1)
+        self.assertNotIn("result=collapsed", text)
+        played = play_log.read_text(encoding="utf-8") if play_log.exists() else ""
+        self.assertEqual(played.count("Glass.aiff"), 1)
+
+    def test_same_rule_different_bot_plays_both(self):
+        config, state, env, play_log, log_path = self._layout()
+        self._notify(env, config, state, "Red")
+        text = self._wait(log_path, lambda raw: "result=play" in raw)
+        self.assertIn("result=play", text)
+        self._notify(env, config, state, "Blue")
+        text = self._wait(log_path, lambda raw: raw.count("result=play") >= 2)
+        self.assertGreaterEqual(text.count("result=play"), 2)
+        self.assertNotIn("result=dup", text)
+        played = self._wait(play_log, lambda raw: raw.count("Glass.aiff") >= 2)
+        self.assertGreaterEqual(played.count("Glass.aiff"), 2)
+
+    def test_zero_dedupe_window_plays_both(self):
+        config, state, env, play_log, log_path = self._layout()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "grokbot_notify_sounds.py"),
+                "--set",
+                "dedupe_window_seconds=0",
+                "--config",
+                str(config),
+                "--state",
+                str(state),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["dedupe_window_seconds"], 0)
+        self._notify(env, config, state, "Red")
+        text = self._wait(log_path, lambda raw: "result=play" in raw)
+        self.assertIn("result=play", text)
+        self._notify(env, config, state, "Red")
+        text = self._wait(log_path, lambda raw: raw.count("result=play") >= 2)
+        self.assertGreaterEqual(text.count("result=play"), 2)
+        self.assertNotIn("result=dup", text)
+        played = self._wait(play_log, lambda raw: raw.count("Glass.aiff") >= 2)
+        self.assertGreaterEqual(played.count("Glass.aiff"), 2)

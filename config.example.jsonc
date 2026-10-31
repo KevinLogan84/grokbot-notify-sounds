@@ -24,6 +24,10 @@
   "burst_threshold": 3,
   "burst_window_seconds": 5,
 
+  // Same rule and bot inside this window plays once. Omit the key to use
+  // burst_window_seconds. 0 turns dedupe off.
+  // "dedupe_window_seconds": 5,
+
   // Waiting items past this cap are counted into the collapse instead of queued.
   "queue_max": 20,
 

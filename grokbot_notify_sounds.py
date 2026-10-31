@@ -535,6 +535,13 @@ def normalize_config(data: object) -> dict:
             errors.append("burst_window_seconds must be a number >= 0")
         else:
             burst_window = float(raw_window)
+    dedupe_window = None
+    if "dedupe_window_seconds" in data:
+        raw_dedupe = data["dedupe_window_seconds"]
+        if not _is_finite_number(raw_dedupe) or raw_dedupe < 0:
+            errors.append("dedupe_window_seconds must be a number >= 0")
+        else:
+            dedupe_window = float(raw_dedupe)
     queue_max = 20
     if "queue_max" in data:
         queue_max = _require_int(data["queue_max"], "queue_max", 1, errors, 20)
@@ -577,7 +584,7 @@ def normalize_config(data: object) -> dict:
 
     if errors:
         raise ConfigError(errors)
-    return {
+    normalized = {
         "enabled": enabled,
         "paused": paused,
         "poll_interval_seconds": poll,
@@ -593,6 +600,9 @@ def normalize_config(data: object) -> dict:
         "default": default,
         "rules": rules,
     }
+    if dedupe_window is not None:
+        normalized["dedupe_window_seconds"] = dedupe_window
+    return normalized
 
 
 def builtin_defaults() -> dict:
@@ -938,8 +948,11 @@ def render_test(outcome: Outcome) -> str:
     ]
     if match.voice:
         lines.append(f"voice: {match.voice}")
-    lines.append(f"result: {outcome.result}")
-    if outcome.result == "play-soft":
+    if outcome.result == "soft":
+        lines.append("result=soft")
+    else:
+        lines.append(f"result: {outcome.result}")
+    if outcome.result in ("play-soft", "soft"):
         lines.append(f"effective_sound: {outcome.effective_sound}")
         lines.append(f"effective_volume: {outcome.effective_volume}")
         lines.append(f"effective_say: {'yes' if outcome.effective_say else 'no'}")
@@ -1210,6 +1223,52 @@ def save_cooldown(path: Path, name: str, when: datetime) -> None:
         _write_state_document(path, data)
 
 
+def dedupe_window_seconds(config: dict) -> float:
+    """Absent key follows the burst window. Zero turns dedupe off."""
+    if "dedupe_window_seconds" in config:
+        return float(config["dedupe_window_seconds"])
+    return float(config.get("burst_window_seconds", 5))
+
+
+def load_dedupe(path: Path) -> list[dict]:
+    raw = _read_state_document(path).get("dedupe")
+    found = []
+    if not isinstance(raw, list):
+        return found
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule")
+        bot = item.get("bot")
+        at = item.get("at")
+        if isinstance(rule, str) and isinstance(bot, str) and type(at) in (int, float):
+            found.append({"rule": rule, "bot": bot, "at": float(at)})
+    return found
+
+
+def save_dedupe_play(path: Path, rule: str, bot: str, when: float) -> None:
+    path = Path(path)
+    with _STATE_LOCK:
+        data = _read_state_document(path)
+        rows = []
+        for item in data.get("dedupe") if isinstance(data.get("dedupe"), list) else []:
+            if isinstance(item, dict) and item.get("rule") == rule and item.get("bot") == bot:
+                continue
+            rows.append(item)
+        rows.append({"rule": rule, "bot": bot, "at": float(when)})
+        data["dedupe"] = rows
+        _write_state_document(path, data)
+
+
+def is_deduped(path: Path, rule: str, bot: str, now: float, window: float) -> bool:
+    if window <= 0 or not bot:
+        return False
+    for row in load_dedupe(path):
+        if row["rule"] == rule and row["bot"] == bot and (now - row["at"]) < window:
+            return True
+    return False
+
+
 class PlaybackError(Exception):
     def __init__(self, code: int):
         self.code = int(code)
@@ -1277,16 +1336,35 @@ def poll_once(
                     cooldowns=cooldowns,
                     mark=queue is None,
                 )
+                sound_name = outcome.effective_sound or outcome.match.sound
+                bot_key = outcome.match.bot or ""
+                if outcome.commands and bot_key and is_deduped(
+                    state_path,
+                    outcome.match.rule_name,
+                    bot_key,
+                    time.time(),
+                    dedupe_window_seconds(config),
+                ):
+                    LOG.info(
+                        "rec_id=%s rule=%s sound=%s result=dup",
+                        rec_id,
+                        outcome.match.rule_name,
+                        sound_name,
+                    )
+                    save_state(state_path, rec_id)
+                    continue
                 if outcome.commands:
                     if queue is not None:
                         queue.enqueue(item_from_outcome(outcome, queue.clock()))
                     else:
                         play(outcome.commands)
+                        if bot_key:
+                            save_dedupe_play(state_path, outcome.match.rule_name, bot_key, time.time())
                 LOG.info(
                     "rec_id=%s rule=%s sound=%s result=%s",
                     rec_id,
                     outcome.match.rule_name,
-                    outcome.effective_sound or outcome.match.sound,
+                    sound_name,
                     outcome.result,
                 )
             except Exception as exc:
@@ -1340,7 +1418,7 @@ def _load_text_or_exit(path: Path) -> str | None:
 NULLABLE_RULE_KEYS = {"bot", "contains", "regex", "volume", "voice", "category", "say_text"}
 SET_BOOL_KEYS = {"enabled", "paused", "quiet_hours.enabled", "default.say"}
 SET_INT_KEYS = {"master_volume", "default.volume", "burst_threshold", "queue_max"}
-SET_NUMBER_KEYS = {"poll_interval_seconds", "cooldown_seconds", "burst_window_seconds"}
+SET_NUMBER_KEYS = {"poll_interval_seconds", "cooldown_seconds", "burst_window_seconds", "dedupe_window_seconds"}
 SET_STRING_KEYS = {
     "bundle_id",
     "default.sound",
@@ -1788,11 +1866,18 @@ def read_voice_listing() -> str | None:
 
 def parse_voices(text: str) -> list:
     voices = []
+    seen: set[tuple[str, str]] = set()
     for line in text.splitlines():
         match = _VOICE_LINE.match(line.strip())
         if match is None:
             continue
-        voices.append(Voice(match.group(1).strip(), match.group(2)))
+        name = match.group(1).strip()
+        lang = match.group(2)
+        key = (name, lang)
+        if key in seen:
+            continue
+        seen.add(key)
+        voices.append(Voice(name, lang))
     return voices
 
 
@@ -2086,7 +2171,14 @@ class PlayItem:
 def item_from_outcome(outcome, enqueued_at: float) -> PlayItem:
     say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
     sound = outcome.effective_sound or outcome.match.sound
-    return PlayItem(outcome.commands, outcome.match.rule_name, enqueued_at, say, sound=sound)
+    return PlayItem(
+        outcome.commands,
+        outcome.match.rule_name,
+        enqueued_at,
+        say,
+        sound=sound,
+        bot=outcome.match.bot,
+    )
 
 
 class PlaybackQueue:
@@ -2106,10 +2198,57 @@ class PlaybackQueue:
         self._stop = False
         self._busy = False
         self._thread = None
+        self._played_at: dict[tuple[str, str], float] = {}
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, name="playback", daemon=True)
         self._thread.start()
+
+    def _bot_key(self, item: PlayItem) -> str:
+        bot = item.bot
+        return bot if isinstance(bot, str) else ""
+
+    def _is_dup(self, item: PlayItem, config: dict) -> bool:
+        window = dedupe_window_seconds(config)
+        if window <= 0:
+            return False
+        key = (item.rule_name, self._bot_key(item))
+        if not key[1]:
+            return False
+        now = time.time()
+        previous = self._played_at.get(key)
+        if previous is not None and (now - previous) < window:
+            return True
+        if self.book is None:
+            return False
+        return is_deduped(self.book.path, key[0], key[1], now, window)
+
+    def _remember_play(self, item: PlayItem) -> None:
+        key = (item.rule_name, self._bot_key(item))
+        if not key[1]:
+            return
+        now = time.time()
+        self._played_at[key] = now
+        if self.book is not None:
+            save_dedupe_play(self.book.path, key[0], key[1], now)
+
+    def _log_burst_summary(self, commands, head: PlayItem | None, config: dict) -> None:
+        sound = head.sound if head is not None and head.sound else ""
+        volume = ""
+        spoken = "none"
+        if commands:
+            first = commands[0]
+            if len(first) >= 3 and first[0] == "afplay":
+                volume = str(first[2])
+            if not sound and len(first) >= 4:
+                name = Path(str(first[3])).name
+                sound = name[:-5] if name.endswith(".aiff") else str(first[3])
+        if not sound:
+            sound = str(config["default"]["sound"])
+        for command in commands[1:]:
+            if command and command[0] == "say" and command[-1]:
+                spoken = str(command[-1])
+        LOG.info("burst summary: sound=%s volume=%s say=%s", sound, volume, spoken)
 
     def enqueue(self, item: PlayItem) -> None:
         config = self.config_getter()
@@ -2233,17 +2372,29 @@ class PlaybackQueue:
                     continue
                 break
             item = batch.pop(0)
-            if self._cooling(item, self.config_getter()):
+            fresh = self.config_getter()
+            if self._cooling(item, fresh):
                 self._log_notify(item, "skip-cooldown")
+                continue
+            if self._is_dup(item, fresh):
+                self._log_notify(item, "dup")
                 continue
             self._play_locked(item.commands)
             self._mark(item)
+            self._remember_play(item)
             self._log_notify(item, "play")
             played += 1
         if self.hold_for_burst:
             while not self._stop and self.clock() < deadline:
                 time.sleep(0.02)
         batch.extend(self._take_in_window(deadline))
+        kept = []
+        for item in batch:
+            if self._is_dup(item, self.config_getter()):
+                self._log_notify(item, "dup")
+            else:
+                kept.append(item)
+        batch = kept
         with self._cv:
             overflow = self._overflow
             self._overflow = 0
@@ -2251,7 +2402,12 @@ class PlaybackQueue:
         if count <= 0:
             return
         head = batch[0] if batch else None
-        self._play_locked(self._summary_commands(head, self.config_getter(), count - 1))
+        fresh = self.config_getter()
+        summary = self._summary_commands(head, fresh, count - 1)
+        self._log_burst_summary(summary, head, fresh)
+        self._play_locked(summary)
+        if head is not None:
+            self._remember_play(head)
         for item in batch:
             self._log_notify(item, "collapsed")
         LOG.info("burst collapsed (%s)", count)
@@ -2475,6 +2631,20 @@ def enqueue_notification(
             outcome.result,
         )
         return outcome.result
+    if is_deduped(
+        state_path,
+        outcome.match.rule_name,
+        bot,
+        time.time(),
+        dedupe_window_seconds(config),
+    ):
+        LOG.info(
+            "notify bot=%s rule=%s sound=%s result=dup",
+            bot,
+            outcome.match.rule_name,
+            sound,
+        )
+        return "dup"
     say = outcome.effective_say if outcome.effective_say is not None else outcome.match.say
     append_notify_item(
         state_path,
@@ -2574,38 +2744,70 @@ def write_agent_plist(home: Path, python: str, script: str) -> Path:
     return dest
 
 
+def _run_launchctl(runner, args: list[str]) -> tuple[int, str]:
+    command = ["launchctl", *args]
+    try:
+        result = runner(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except TypeError:
+        try:
+            result = runner(command)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 1, str(exc)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    if result is None:
+        return 0, ""
+    code = getattr(result, "returncode", 0)
+    err = getattr(result, "stderr", "") or ""
+    out = getattr(result, "stdout", "") or ""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    text = str(err).strip() or str(out).strip()
+    return int(code if code is not None else 0), text
+
+
 def sync_agent_mode(mode: str, home: Path | None = None, *, finder=None, run=None) -> str | None:
-    """Load or unload the agent. None means launchctl ran. A string means it did not."""
+    """Load or unload the agent.
+
+    None means the agent was loaded or unloaded. ``agent was not changed`` means
+    launchctl is missing. Any other string is a load failure.
+    """
     home = Path.home() if home is None else Path(home)
     finder = shutil.which if finder is None else finder
     if not finder("launchctl"):
         return "agent was not changed"
     runner = subprocess.run if run is None else run
-
-    def invoke(args: list[str]) -> None:
-        command = ["launchctl", *args]
-        try:
-            runner(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except TypeError:
-            try:
-                runner(command)
-            except (OSError, subprocess.SubprocessError):
-                pass
-        except (OSError, subprocess.SubprocessError):
-            pass
-
     label = f"gui/{os.getuid()}/{AGENT_LABEL}"
     if mode == "notify":
-        invoke(["bootout", label])
+        _run_launchctl(runner, ["bootout", label])
         return None
     script = home / "Library" / "Application Support" / "GrokBotNotifySounds" / "grokbot_notify_sounds.py"
     if not script.is_file():
         script = Path(__file__).resolve()
     plist = write_agent_plist(home, sys.executable, str(script))
-    invoke(["bootout", label])
-    invoke(["bootstrap", f"gui/{os.getuid()}", str(plist)])
-    invoke(["enable", label])
-    return None
+    code, _err = _run_launchctl(runner, ["bootout", label])
+    if code == 0:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            printed, _text = _run_launchctl(runner, ["print", label])
+            if printed != 0:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.2, remaining))
+    last_err = ""
+    for attempt in range(3):
+        code, last_err = _run_launchctl(runner, ["bootstrap", f"gui/{os.getuid()}", str(plist)])
+        if code == 0:
+            _run_launchctl(runner, ["enable", label])
+            return None
+        if attempt < 2:
+            time.sleep(1)
+    detail = last_err.strip() or "launchctl bootstrap failed"
+    return f"The agent could not be loaded: {detail}"
 
 
 def set_rule_enabled(raw: dict, name: str, enabled: bool) -> None:
@@ -2767,7 +2969,9 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
     parser.add_argument("--drain-notify", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--respect-cooldown", action="store_true", help="With --test, honor the shared cooldown")
     parser.add_argument("--respect-quiet-hours", action="store_true", help="With --test, honor quiet hours")
-    parser.add_argument("--as-live", action="store_true", help="With --test, honor quiet hours, cooldown, paused, and enabled")
+    parser.add_argument("--as-live", action="store_true", help="With --test, honor quiet hours and cooldown")
+    parser.add_argument("--ignore-quiet-hours", action="store_true", help="With --test, play the matched rule and skip quiet hours")
+    parser.add_argument("--ignore-cooldown", action="store_true", help="With --test, play even when the rule is cooling down")
     parser.add_argument("--status", action="store_true", help="Print a parseable status report")
     parser.add_argument("--pause", action="store_true", help="Set paused true and write the config")
     parser.add_argument("--resume", action="store_true", help="Set paused false and write the config")
@@ -2809,6 +3013,12 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
         return 2
     if args.as_live and "test" not in actions:
         print("--as-live is only used with --test.", file=sys.stderr)
+        return 2
+    if args.ignore_quiet_hours and "test" not in actions:
+        print("--ignore-quiet-hours is only used with --test.", file=sys.stderr)
+        return 2
+    if args.ignore_cooldown and "test" not in actions:
+        print("--ignore-cooldown is only used with --test.", file=sys.stderr)
         return 2
     if (args.notify or args.notify_worker) and not args.bot:
         print("--notify requires --bot NAME.", file=sys.stderr)
@@ -3004,10 +3214,13 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
         if code != 0:
             return code
         note = sync_agent_mode(mode)
-        if note:
+        if note == "agent was not changed":
             print(f"mode set to {mode}; {note}")
-        else:
-            print(f"mode set to {mode}")
+            return 0
+        if note:
+            print(note, file=sys.stderr)
+            return 1
+        print(f"mode set to {mode}")
         return 0
 
     if "test-rule" in actions or "play" in actions or "test" in actions:
@@ -3071,22 +3284,13 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
             return code
         match = classify(args.title, args.subtitle, args.test, config, args.bot)
         now = datetime.now()
-        live = bool(args.as_live)
-        honor_quiet = live or bool(args.respect_quiet_hours)
-        honor_cooldown = live or bool(args.respect_cooldown)
-        if live and not config["enabled"]:
-            print("suppressed because disabled")
-            LOG.info("test rule=%s result=suppressed", match.rule_name)
-            return 0
-        if live and config.get("paused"):
-            print("suppressed because paused")
-            LOG.info("test rule=%s result=suppressed", match.rule_name)
-            return 0
+        honor_quiet = not args.ignore_quiet_hours
+        honor_cooldown = not args.ignore_cooldown
         softened = False
         if honor_quiet and quiet_active(now, config["quiet_hours"]):
             if config["quiet_hours"]["mode"] == "mute":
-                print("quiet hours muted the sound")
-                LOG.info("test rule=%s result=skip-mute", match.rule_name)
+                print("result=muted")
+                LOG.info("test rule=%s sound=%s result=muted", match.rule_name, match.sound)
                 return 0
             softened = True
         if honor_cooldown:
@@ -3105,7 +3309,7 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
             say_text = None
             outcome = Outcome(
                 match,
-                "play-soft",
+                "soft",
                 [],
                 int(config["master_volume"]),
                 effective_sound=sound,
@@ -3136,15 +3340,16 @@ def main(argv: list[str] | None = None, *, log_path: Path | None = None) -> int:
             say_text=say_text,
             bot=match.bot or args.bot,
         )
-        if softened:
-            print("quiet hours softened the sound to the default sound")
         sys.stdout.write(render_test(outcome))
         code = play_reported(outcome.commands, lock_path)
         if code == 0:
             save_cooldown(state_path, match.rule_name, datetime.now())
-            LOG.info("test rule=%s sound=%s result=played", match.rule_name, match.sound)
+            if softened:
+                LOG.info("test rule=%s sound=%s result=soft", match.rule_name, sound)
+            else:
+                LOG.info("test rule=%s sound=%s result=played", match.rule_name, sound)
         else:
-            LOG.info("test rule=%s sound=%s result=error exit %s", match.rule_name, match.sound, code)
+            LOG.info("test rule=%s sound=%s result=error exit %s", match.rule_name, sound, code)
         return code
 
     source = ConfigSource(config_path)

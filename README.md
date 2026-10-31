@@ -6,6 +6,47 @@ There is no settings UI. Change behavior with the flags below, or by editing the
 
 The agent is local. It does not use the network or the Keychain. It opens the Notification Center database read-only. The log records record ids, rule names, and sounds. It does not store full notification text.
 
+## Privacy
+
+No network access, no telemetry, no analytics, no tracking, no crash reporting, no update checks. Nothing leaves your Mac. It reads the local Notification Center database (watch mode only) and its own config, and plays sounds with afplay/say. It never touches the Keychain.
+
+`say -v '?'` is a local process, not a network call. `afplay`, `say`, `launchctl`, and `getconf DARWIN_USER_DIR` are local processes. The tool does not phone home, and it does not download or check a hash.
+
+Reads:
+
+- `~/.config/grokbot-sounds/config.json`
+- `~/Library/Application Support/GrokBotNotifySounds/state.json` (cursor, cooldown times, and dedupe times)
+- `~/Library/Application Support/GrokBotNotifySounds/voices.json` (cached output of `say -v '?'`)
+- `~/Library/Application Support/GrokBotNotifySounds/notify-queue.json` (queued `--notify` items)
+- Notification Center, watch mode only, read-only: `~/Library/Group Containers/group.com.apple.usernoted/db2/db` and `$DARWIN_USER_DIR/com.apple.notificationcenter/db2/db` (`DARWIN_USER_DIR` comes from `getconf`)
+- `/System/Library/Sounds` when listing or checking built-in sounds
+- Custom sound paths named in the config, when a rule or the default uses a file
+
+Writes:
+
+- `~/.config/grokbot-sounds/config.json` (the CLI and the installer). Install copies `config.example.jsonc` to `~/.config/grokbot-sounds/config.example.jsonc` and refreshes that copy. The player does not read the example.
+- `~/Library/Application Support/GrokBotNotifySounds/state.json`
+- `~/Library/Application Support/GrokBotNotifySounds/playback.lock`
+- `~/Library/Application Support/GrokBotNotifySounds/voices.json`
+- `~/Library/Application Support/GrokBotNotifySounds/notify-queue.json`
+- `~/Library/Application Support/GrokBotNotifySounds/notify-drainer.pid`, `notify-spawn.lock`, and `notify-queue.lock`
+- `~/Library/Logs/grokbot-notify-sounds.log` and its rotated backups
+- `~/Library/LaunchAgents/com.grokbot.notify-sounds.plist`
+- `~/Library/Application Support/GrokBotNotifySounds/grokbot_notify_sounds.py` (the installed copy of this script)
+- `~/.local/bin/grokbot-notify-sounds` (the shim install writes)
+
+Config and state writes go through a temporary file in the same directory, then replace the real file.
+
+## Verify your download
+
+Compare the file you have with the SHA-256 published on the release page:
+
+```sh
+shasum -a 256 <file>
+```
+
+The tool does not download or check that hash itself.
+
 ## Install
 
 Pick one mode. If both the LaunchAgent and `--notify` deliver the same message, it can play twice.
@@ -69,12 +110,13 @@ Volumes are integers from 0 to 100. `master_volume` defaults to 100 when omitted
 - `paused` (bool, default false). Separate from `enabled`. `true` plays nothing and speaks nothing, and still advances the cursor, so resume does not replay a backlog. A sound plays only when enabled, not paused, and not suppressed by quiet hours, cooldown, a disabled rule, or a bot listed in `notify_bots`.
 - `mode` (`watch` or `notify`, default `watch`).
 - `notify_bots` (optional list of bot names). The watch daemon skips playback when the title or subtitle contains one of these names (case-insensitive) and still advances the cursor, so `--notify` is the only player for them. Omit the list and the daemon skips nobody.
-- `burst_threshold` (integer, default 3) and `burst_window_seconds` (number, default 5). Inside one window the first `threshold - 1` items each play that item's own rule sound, volume, and speech. Starting with the threshold-th item, the rest collapse into one extra play of that item's sound (the default sound only when that item already fell through to `default`). If say is on for that item and later items were collapsed with it, it says `and N more` (N is the count after that first collapsed item; it does not say `and 0 more`). The log line is `burst collapsed (N)` where N is how many items were not played on their own. `--notify` keeps the playback lock released while it waits out the window. `queue_max` (integer, default 20) caps the queue; extras count toward that collapse.
+- `burst_threshold` (integer, default 3) and `burst_window_seconds` (number, default 5). Inside one window the first `threshold - 1` items each play that item's own rule sound, volume, and speech. Starting with the threshold-th item, the rest collapse into one extra play of that item's sound (the default sound only when that item already fell through to `default`). If say is on for that item and later items were collapsed with it, it says `and N more` (N is the count after that first collapsed item; it does not say `and 0 more`). The log line is `burst collapsed (N)` where N is how many items were not played on their own. That extra play is also logged as `burst summary: sound=<name> volume=<0-1> say=<text>`. `volume` is the value passed to `afplay -v`. When nothing is spoken, `say=none`. `--notify` keeps the playback lock released while it waits out the window. `queue_max` (integer, default 20) caps the queue; extras count toward that collapse.
+- `dedupe_window_seconds` (number, optional). When the key is absent, it uses `burst_window_seconds`. `0` turns dedupe off. If an alert has the same rule name and the same bot as one that already played inside this window, it does not play again and logs `result=dup`. A different bot or a different rule still plays. An alert with no bot is not deduped. A duplicate is not a new burst item and is not `result=play` or `result=collapsed`. `--set dedupe_window_seconds=0` stores that value.
 - `cooldown_seconds` is still per rule name. Last-played times are stored in the state file so the daemon and the CLI share them. A rule inside its cooldown is not enqueued. Collapsed items do not refresh cooldown except the item that actually played.
 - `poll_interval_seconds` (number greater than 0).
 - `bundle_id` (string).
 - `master_volume` (integer 0–100).
-- `cooldown_seconds` (number, `0` off). The fallback key is `default`. A skipped play does not reset the window. `--test` plays unless you pass `--respect-cooldown`, which uses the same state file. A real `--test` play updates that timestamp.
+- `cooldown_seconds` (number, `0` off). The fallback key is `default`. A skipped play does not reset the window. `--test` honors cooldown. `--ignore-cooldown` plays anyway. A real `--test` play updates that timestamp.
 - `quiet_hours.enabled` (bool), `quiet_hours.start` and `quiet_hours.end` (`HH:MM`, local), `quiet_hours.mode` (`mute` or `soft`). If start is later than end, the window wraps midnight. `mute` plays nothing and does not speak. `soft` plays only the default sound and volume, and speaks only when `default.say` is true.
 - `default.sound`, `default.volume` (integer 0–100). Optional `default.say` (bool, default false) and `default.voice` (string or null).
 - `rules` (ordered list). First match wins.
@@ -195,7 +237,7 @@ python3 grokbot_notify_sounds.py --set default.say=true
 python3 grokbot_notify_sounds.py --update-rule "Alfred shipped" '{"say": true, "voice": "Samantha"}'
 ```
 
-`voice`, when set, must match a line from `say -v '?'`. The match is case-insensitive against the full display name or the bare name (trailing parenthetical groups stripped, so `Flo (English (US))` matches `Flo`). If several voices share a bare name, the full name wins; otherwise `(Premium)`, then `(Enhanced)`, then the plain name. The config keeps the string you set. Playback passes the listing's display name to `say -v`. Omit it and, only when `say` is true, the program picks the first installed `(Premium)` voice, preferring `en_US` then any `en_*`, then the same for `(Enhanced)`. If none of those are installed it uses the system voice and does not pass `-v`. One-time download path: System Settings > Accessibility > Spoken Content > System voice > Manage Voices. `--list-voices` prints the installed voices, tags Premium and Enhanced, and stars the auto-picked one. A parsed voice list is cached next to the state file so later runs can skip `say -v '?'`.
+`voice`, when set, must match a line from `say -v '?'`. The match is case-insensitive against the full display name or the bare name (trailing parenthetical groups stripped, so `Flo (English (US))` matches `Flo`). If several voices share a bare name, the full name wins; otherwise `(Premium)`, then `(Enhanced)`, then the plain name. The config keeps the string you set. Playback passes the listing's display name to `say -v`. Omit it and, only when `say` is true, the program picks the first installed `(Premium)` voice, preferring `en_US` then any `en_*`, then the same for `(Enhanced)`. If none of those are installed it uses the system voice and does not pass `-v`. One-time download path: System Settings > Accessibility > Spoken Content > System voice > Manage Voices. `--list-voices` prints the installed voices, tags Premium and Enhanced, and stars the auto-picked one. The same display name and locale are listed once; a different locale stays as its own line. A parsed voice list is cached next to the state file so later runs can skip `say -v '?'`. `say -v '?'` is a local process, not a network call.
 
 `--set key=value` checks the same rules as the rest of the CLI. Volume stays an integer 0–100, a sound must exist, a voice must be installed when it is set, and quiet-hours mode must be `mute` or `soft`. A value that starts with `[` or `{` is JSON, so `--set 'notify_bots=["Karen · Shopper"]'` keeps the middle dot. A plain string for `notify_bots` is a one-element list, and `notify_bots=[]` clears it. An invalid value prints one line on stderr, exits 2, and leaves the file unchanged. Success is one line, for example `set default.voice=Samantha`. `--set default.voice=` and `--unset default.voice` remove that key and print `unset default.voice`. The same empty value and `--unset` work for any optional key `--set` accepts. If removing the key would make the config invalid, nothing is written. These keys work: `default.voice`, `default.sound`, `default.volume`, `default.say`, `quiet_hours.start`, `quiet_hours.end`, `quiet_hours.mode`, `notify_bots`. Missing `default` or `quiet_hours` objects are created. `--status` prints `notify_bots` as JSON.
 
@@ -217,10 +259,10 @@ Read-only and playback:
 - `--validate` — schema, missing custom files, and unknown built-in names when `/System/Library/Sounds` exists. Prints `ok` and exits 0 when the config is valid. Errors stay one line and exit 2.
 - `--list-rules` — `name: sound` in list order, including disabled rules. No database.
 - `--list-sounds` — one line per built-in, `Glass: bright glassy chime` and the other thirteen names with a short description, then each custom path from `default` or `rules` as `path: custom file`.
-- `--list-voices` — installed voices. Stars the auto-picked Premium or Enhanced voice.
-- `--notify` — `--notify --bot NAME [--title TEXT] [--body TEXT]`. Does not open the Notification Center database and does not need Full Disk Access. The parent parses `--bot` and spawns a worker, then returns, before importing the player and before `say -v '?'`. The worker runs the same rules, volume, quiet hours, cooldown, burst collapse, and playback lock as the daemon. Suppressed items log the reason and play nothing. A missing `--bot` prints one line and exits 2.
+- `--list-voices` — installed voices. Stars the auto-picked Premium or Enhanced voice. One line per display name and locale.
+- `--notify` — `--notify --bot NAME [--title TEXT] [--body TEXT]`. Does not open the Notification Center database and does not need Full Disk Access. The parent parses `--bot` and spawns a worker, then returns, before importing the player and before `say -v '?'`. The worker runs the same rules, volume, quiet hours, cooldown, dedupe, burst collapse, and playback lock as the daemon. Suppressed items log the reason and play nothing. A missing `--bot` prints one line and exits 2.
 - `--list-apps` — bundle ids, one per line, sorted.
-- `--test TEXT` — TEXT is the body. Optional `--title`, `--subtitle`, and `--bot`. `--bot` is the sender matched against a rule's `bot` field and does not also have to appear in the title. Without extra flags it previews the matched rule even during quiet hours. `--respect-quiet-hours` honors quiet hours and says when they muted the sound or softened it to the default sound. `--respect-cooldown` honors cooldown. `--as-live` applies quiet hours, cooldown, paused, and enabled together.
+- `--test TEXT` — TEXT is the body. Optional `--title`, `--subtitle`, and `--bot`. `--bot` is the sender matched against a rule's `bot` field and does not also have to appear in the title. Quiet hours and cooldown apply, the same as the daemon and `--notify`. Soft quiet hours play the default sound and print and log `result=soft`. Mute quiet hours play nothing and print and log `result=muted`. `--ignore-quiet-hours` plays the matched rule sound and skips quiet hours. `--ignore-cooldown` plays even when the rule is inside its cooldown. The two ignore flags can be combined. `--respect-quiet-hours` and `--as-live` are aliases of this default.
 - `--test-rule NAME` — print that rule and play its sound at the effective volume (rule volume, or the default, times master). Plays even when the rule is disabled, and prints that. Exit non-zero if the name does not exist.
 - `--play SOUND` — preview a built-in name or a custom path. `--volume N` is 0–100 and defaults to 100. Effective afplay volume is `(N / 100) * (master_volume / 100)`.
 - `--once` — poll once and exit. With no command flag, the process keeps polling.
