@@ -1172,7 +1172,8 @@ class NotifyParentTests(unittest.TestCase):
 
 class BurstProcessTests(unittest.TestCase):
     def test_six_processes_collapse_from_the_third_rule(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # The detached drain worker can still be writing state when the test ends.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             home = Path(tmp)
             config = home / "config.json"
             state = home / "state" / "state.json"
